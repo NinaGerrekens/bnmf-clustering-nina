@@ -19,9 +19,12 @@ The bNMF procedure, as applied here, detects clusters of GWAS variants for some 
    uses the supplied toy summary statistics and does not require an LDlink token.
 2. To adapt the example for a project, copy the driver and manifest, replace the
    input paths, and review the thresholds in the configuration section.
-3. Enable LDlink pruning only after setting the `LDLINK_TOKEN` environment
-   variable. Proxy replacement additionally requires the per-chromosome rsID
-   maps described below.
+3. Choose a pruning strategy if needed. The example supports LD-based pruning
+   through LDlink SNPclip after setting the `LDLINK_TOKEN` environment variable;
+   `snp_clump()` is also available for deliberate position-based clumping. These
+   are distinct approaches, and the self-contained toy run applies neither by
+   default. Proxy replacement additionally requires the per-chromosome rsID maps
+   described below.
 
 The public example ends after `summarize_bNMF()`. Project-specific annotation,
 reporting, and post-hoc analysis should be added in a separate project driver.
@@ -57,8 +60,8 @@ See `example_data/clustering_data_source_example.xlsx` for a working example of 
 #### `choose_variants_2025.R` — Variant selection and proxy search
 * **`get_sig_snps()`** — Extract genome-wide significant variants from GWAS summary statistics
 * **`get_biggest_gwas()`** — Retrieve variant info from the primary (largest) GWAS file
-* **`snp_clump()`** — Position-based clumping of variants within a window
-* **`ld_pruning_SNP.clip()`** — Multi-population LD pruning via LDlink SNPclip API
+* **`snp_clump()`** — Optional position-based clumping utility (not used by the generic example); use when physical distance, rather than measured LD, is the intended rule
+* **`ld_pruning_SNP.clip()`** — Multi-population LD-based pruning via the LDlink SNPclip API
 * **`window_to_sentinels()`** — Restrict a variant pool to within a window of LD-pruned sentinels (keeps proxy candidate fetch tractable for polygenic traits)
 * **`find_variants_needing_proxies()`** — Flag strand-ambiguous, multiallelic, or high-missingness variants for proxy replacement
 * **`choose_proxies()`** — Search for LD proxies via LDlinkR and select the best candidate per variant

@@ -9,10 +9,12 @@
 # preparation, bNMF, and summarize_bNMF(); project-specific post-processing
 # belongs in a separate analysis script.
 #
-# By default, the example uses position-based clumping and keeps the resulting
-# original variants. LDlink pruning and proxy replacement are optional because
-# they require an LDlink token and, for proxies, a current per-chromosome rsID
-# map. The supplied toy data can therefore run without either external input.
+# By default, the example keeps the sentinel-level variants without a clumping
+# or external LD-pruning step. Projects may instead choose position-based
+# clumping with snp_clump() or LD-based pruning with LDlink SNPclip; these are
+# distinct strategies and should be selected deliberately. LDlink pruning and
+# proxy replacement require an LDlink token and, for proxies, a current
+# per-chromosome rsID map. The toy data can run without either external input.
 # =============================================================================
 
 suppressPackageStartupMessages({
@@ -55,7 +57,6 @@ dir.create(main_dir, recursive = TRUE, showWarnings = FALSE)
 PVCUTOFF <- 5e-8
 PVCUTOFF_PROXY <- 5e-6
 PROXY_WINDOW_KB <- 500
-CLUMP_WINDOW_BP <- 100e3
 
 # External LD operations are disabled for the self-contained toy run.
 RUN_LDLINK_PRUNING <- FALSE
@@ -134,7 +135,7 @@ trait_ss_files <- setNames(gwas_traits$full_path, gwas_traits$trait)
 trait_ss_size <- setNames(as.numeric(gwas_traits$sample_size), gwas_traits$trait)
 
 # =============================================================================
-# 2. Select and position-clump sentinel variants
+# 2. Select sentinel variants
 # =============================================================================
 
 # The broad set supplies possible proxy candidates. Sentinel eligibility is
@@ -194,17 +195,14 @@ if (nrow(sentinel_candidates) == 0L) {
   stop("No sentinel variants passed PVCUTOFF.")
 }
 
-clumped_ids <- snp_clump(
-  sentinel_candidates,
-  id = "VAR_ID",
-  window = CLUMP_WINDOW_BP
-)
-vars_clumped <- sentinel_candidates %>%
-  filter(VAR_ID %in% clumped_ids)
+# This example leaves the significant candidates unclumped. For projects where
+# physical-distance clumping is intended, call snp_clump() here and subset
+# sentinel_candidates to the returned IDs. For LD-based pruning, enable the
+# SNPclip step below instead; position-based clumping is not a substitute for LD.
 
 message(sprintf(
-  "Variant selection: %d broad candidates, %d sentinels, %d after position clumping.",
-  nrow(vars_no_hla), nrow(sentinel_candidates), nrow(vars_clumped)
+  "Variant selection: %d broad candidates and %d sentinel-level variants.",
+  nrow(vars_no_hla), nrow(sentinel_candidates)
 ))
 
 # =============================================================================
@@ -217,7 +215,7 @@ if (RUN_LDLINK_PRUNING) {
 
   for (ld_pop in LD_POPS) {
     ld_pruning_SNP.clip(
-      df_snps = vars_clumped,
+      df_snps = sentinel_candidates,
       pop = ld_pop,
       output_dir = ld_result_dir,
       r2 = LD_R2,
@@ -251,13 +249,13 @@ if (RUN_LDLINK_PRUNING) {
     count(Position, RS_Number, name = "n_pop") %>%
     filter(n_pop == length(LD_POPS))
 
-  pruned_vars <- vars_clumped %>%
+  pruned_vars <- sentinel_candidates %>%
     inner_join(kept_in_every_panel,
                by = c("ChrPos_LDlink" = "Position")) %>%
     select(-n_pop)
 } else {
-  message("LDlink pruning is disabled; using position-clumped toy sentinels.")
-  pruned_vars <- vars_clumped %>%
+  message("LDlink pruning is disabled; using all toy sentinel-level variants.")
+  pruned_vars <- sentinel_candidates %>%
     mutate(RS_Number = NA_character_)
 }
 
