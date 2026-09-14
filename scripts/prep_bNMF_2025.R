@@ -83,7 +83,7 @@ read_single_trait_dt <- function(trait,
   # If trait uses underscore format, we want "N_pos"
   # We'll detect trait sample to know what's needed
   # Read a tiny sample from trait file to detect its ID style
-  sample_trait_id <- fread(cmd = if (endsWith(trait_file, ".gz")) sprintf("gzip -cd %s | head -n 5", trait_file) else sprintf("head -n 5 %s", trait_file),
+  sample_trait_id <- fread(cmd = if (endsWith(trait_file, ".gz")) sprintf("gzip -cd %s | head -n 5", shQuote(trait_file)) else sprintf("head -n 5 %s", shQuote(trait_file)),
                            select = id_col_in_file, data.table = FALSE, showProgress = FALSE)[1,1]
   
   trait_has_chr_prefix       <- grepl("^chr", sample_trait_id, ignore.case = TRUE)
@@ -136,9 +136,9 @@ read_single_trait_dt <- function(trait,
   
   # ---- 4. Grep/read trait file for matches ----
   cmd_str <- if (endsWith(trait_file, ".gz")) {
-    sprintf("gzip -cd %s | grep -Ff %s", trait_file, tmp_var_file)
+    sprintf("gzip -cd %s | grep -Ff %s", shQuote(trait_file), shQuote(tmp_var_file))
   } else {
-    sprintf("grep -Ff %s %s", tmp_var_file, trait_file)
+    sprintf("grep -Ff %s %s", shQuote(tmp_var_file), shQuote(trait_file))
   }
   
   dt <- tryCatch({
@@ -378,7 +378,9 @@ read_single_trait_dt <- function(trait,
   return(dt)
 }
 
-fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss_size = NULL, pval_cutoff = 1, checkpoint_dir = NULL) {
+fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files,
+                                trait_ss_size = NULL, pval_cutoff = 1,
+                                pval_bonf = NULL, checkpoint_dir = NULL) {
   
   # GOAL: Fetches and aligns summary statistics using "Chr:Pos" as the standard SNP identifier.
   #
@@ -402,16 +404,17 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   # --- 1. Process Primary GWAS ---
   
   print("Writing SNP list (chr:pos) to file for grepping...")
-  tmp_var_file <- "variants_to_query.tmp"
+  tmp_var_file <- tempfile("variants_to_query_", fileext = ".tmp")
+  on.exit(unlink(tmp_var_file), add = TRUE)
   writeLines(df_input$SNP, tmp_var_file)
   
   if (is.character(gwas_ss_file)) {
     print("Reading primary GWAS summary statistics from file...")
     headers <- as.character(fread(gwas_ss_file, nrows = 1, data.table = F, header = F))
     cmd_grep <- if (endsWith(gwas_ss_file, ".gz")) {
-      sprintf("gzip -cd %s | grep -Fwf %s", gwas_ss_file, tmp_var_file)
+      sprintf("gzip -cd %s | grep -Fwf %s", shQuote(gwas_ss_file), shQuote(tmp_var_file))
     } else {
-      sprintf("grep -Fwf %s %s", gwas_ss_file, tmp_var_file)
+      sprintf("grep -Fwf %s %s", shQuote(tmp_var_file), shQuote(gwas_ss_file))
     }
     gwas_ss <- fread(cmd = cmd_grep, header = F, col.names = headers, data.table = FALSE, stringsAsFactors = FALSE)
   } else {
@@ -452,7 +455,19 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   
   print(paste0(nrow(df_input_wGWAS), " variants available after merging with primary GWAS."))
   
-  pval_bonf <- 0.05 / nrow(df_input_wGWAS)
+  # Legacy callers receive the original behavior: Bonferroni is based on all
+  # input variants available in the primary GWAS.  Proxy-enabled pipelines can
+  # instead supply a threshold based on their independent sentinel count, so a
+  # widened proxy candidate field does not make this directionality check
+  # artificially stringent.
+  if (is.null(pval_bonf)) {
+    pval_bonf <- 0.05 / nrow(df_input_wGWAS)
+  }
+  if (!is.numeric(pval_bonf) || length(pval_bonf) != 1 ||
+      is.na(pval_bonf) || pval_bonf <= 0 || pval_bonf > 1) {
+    stop("pval_bonf must be one numeric probability in (0, 1].")
+  }
+  message(sprintf("Primary-GWAS Bonferroni cutoff: %.3e", pval_bonf))
   opp_risk <- df_input_wGWAS %>% filter(between(P_VALUE, pval_bonf, pval_cutoff) & Risk_Allele != Risk_Allele_Orig)
   high_pval <- df_input_wGWAS %>% filter(P_VALUE > pval_cutoff)
   uniq_to_drop <- unique(c(opp_risk$SNP, high_pval$SNP))
@@ -472,15 +487,41 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
   if (!is.null(checkpoint_dir))
     dir.create(checkpoint_dir, showWarnings = FALSE, recursive = TRUE)
 
+  object_md5 <- function(object) {
+    hash_file <- tempfile("checkpoint_signature_", fileext = ".bin")
+    on.exit(unlink(hash_file), add = TRUE)
+    writeBin(serialize(object, NULL, version = 3), hash_file)
+    unname(tools::md5sum(hash_file))
+  }
+
   # 1. Run lapply on the trait names. This creates an UNNAMED list.
   list_of_results <- lapply(names(trait_ss_files), function(trait) {
     cp_file <- if (!is.null(checkpoint_dir))
       file.path(checkpoint_dir, paste0(gsub("[^A-Za-z0-9_.-]", "_", trait), ".rds"))
     else NULL
 
+    trait_file <- trait_ss_files[[trait]]
+    trait_info <- file.info(trait_file)
+    cp_signature <- object_md5(list(
+      format_version = 1L,
+      trait = trait,
+      trait_file = normalizePath(trait_file, mustWork = TRUE),
+      file_size = trait_info$size,
+      file_mtime = as.numeric(trait_info$mtime),
+      configured_sample_size = unname(trait_ss_size[trait]),
+      SNP = df_read_trait_input$SNP,
+      Risk_Allele = df_read_trait_input$Risk_Allele,
+      Nonrisk_Allele = df_read_trait_input$Nonrisk_Allele
+    ))
+
     if (!is.null(cp_file) && file.exists(cp_file)) {
-      message(sprintf("  [checkpoint] %s", trait))
-      return(readRDS(cp_file))
+      cached <- tryCatch(readRDS(cp_file), error = function(e) NULL)
+      if (is.list(cached) && identical(cached$signature, cp_signature) &&
+          !is.null(cached$result)) {
+        message(sprintf("  [checkpoint] %s", trait))
+        return(cached$result)
+      }
+      message(sprintf("  [stale checkpoint ignored] %s", trait))
     }
 
     result <- tryCatch(
@@ -492,12 +533,17 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
         tmp_var_file = tmp_var_file
       ),
       error = function(e) {
-        message(sprintf("  SKIPPING %s (error): %s", trait, conditionMessage(e)))
-        NULL
+        stop(sprintf("Trait %s failed: %s", trait, conditionMessage(e)),
+             call. = FALSE)
       }
     )
 
-    if (!is.null(cp_file)) saveRDS(result, cp_file)
+    if (is.null(result)) {
+      stop("Trait ", trait, " produced no usable overlapping variants.")
+    }
+    if (!is.null(cp_file)) {
+      saveRDS(list(signature = cp_signature, result = result), cp_file)
+    }
 
     result
   })
@@ -520,11 +566,11 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
     trait_order <- unique(names(trait_ss_files))
 
     # Use data.table dcast — much faster than pivot_wider on large matrices
+    message("Expanding using dcast!")
     trait_df_dt <- as.data.table(trait_df_list)
     trait_df_dt[, trait := factor(trait, levels = trait_order)]
     trait_df_dt <- unique(trait_df_dt, by = c("trait", "SNP"))
 
-    message("Expanding using dcast!")
     message(sprintf("  Pivoting %d trait-SNP pairs to wide format ...", nrow(trait_df_dt)))
 
     z_df_wide  <- dcast(trait_df_dt, SNP ~ trait, value.var = "z")
@@ -544,7 +590,6 @@ fetch_summary_stats <- function(df_input, gwas_ss_file, trait_ss_files, trait_ss
     df_N <- data.frame(matrix(ncol = length(trait_ss_files), nrow = 0, dimnames = list(NULL, names(trait_ss_files))))
   }
   
-  file.remove(tmp_var_file)
   print("Done!")
   return(list(df_z = df_z, df_N = df_N, df_gwas = df_input_wGWAS_filtered))
 }

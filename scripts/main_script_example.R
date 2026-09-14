@@ -1,893 +1,586 @@
+#!/usr/bin/env Rscript
+
 # =============================================================================
-# BMI bNMF Clustering Pipeline
+# Generic bNMF clustering example
 # =============================================================================
-# Description: Full pipeline for BMI GWAS clustering using Bayesian Non-negative
-#              Matrix Factorization (bNMF). Identifies genetic subtypes of BMI
-#              by clustering GWAS loci based on their associations across a panel
-#              of metabolic traits.
 #
-# Usage: Adapt the USER CONFIGURATION section below for your environment, then
-#        run sections sequentially. Steps 2-3 (LD pruning via LDlink) are
-#        commented out by default since they require API access and may be
-#        pre-computed; uncomment to run from scratch.
+# This script runs the bNMF pipeline using the toy summary statistics in
+# example_data/. It is deliberately limited to variant selection, matrix
+# preparation, bNMF, and summarize_bNMF(); project-specific post-processing
+# belongs in a separate analysis script.
 #
-# Version history:
-#  v1  - initial
-#  v2  - LD pruning r2 cutoff from 0.1 → 0.05
-#  v3  - updated BMI GWAS to multi-ancestry list
-#  v4  - removed BMI from trait list
-#  v5  - unisex traits
-#  v6  - removed CIR, DI, Incr30
-#  v7  - added OGTT & cardio traits
-#  v8  - pipeline overhaul
-#  v9  - updated pipeline & bNMF K0 setting
-#  v10 - update WHR GWAS to UKBB-GIANT
-#  v11 - update GWAS away from GIANT
-#  v12 - use old Leptin GWAS as sensitivity analysis
-#  v14 - fix proxy issue
-#  v15 - update Leptin GWAS
-#  v16 - actually fix proxy issue
-#  v17 - update to match CAD-2
-#  v18 - increase trait missingness filter to 30%
+# By default, the example uses position-based clumping and keeps the resulting
+# original variants. LDlink pruning and proxy replacement are optional because
+# they require an LDlink token and, for proxies, a current per-chromosome rsID
+# map. The supplied toy data can therefore run without either external input.
 # =============================================================================
 
-# =====================
-# 0. Setup & Configuration
-# =====================
+suppressPackageStartupMessages({
+  library(data.table)
+  library(dplyr)
+  library(furrr)
+  library(magrittr)
+  library(readr)
+  library(readxl)
+  library(softImpute)
+  library(tidyr)
+})
 
-library(data.table)
-library(dplyr)
-library(magrittr)
-library(readxl)
-library(softImpute)
-library(strex)
-library(tidyverse)
-library(readr)
+# =============================================================================
+# 0. Configuration
+# =============================================================================
 
-# ---- USER CONFIGURATION ----
-# Set these variables before running the pipeline.
-
-# Working directory (root of your project)
-working_dir <- getwd()  # or set explicitly, e.g. "/path/to/project"
-
-# Pipeline version label (used for output directory and checkpoint filenames)
-version <- "my_trait_v1"
-
-# Path to the GWAS manifest Excel file (see example_data/clustering_data_source_example.xlsx for the expected format)
-gwas_file <- file.path(working_dir, "clustering_data_source_example.xlsx")
-
-# Directory for helper R scripts (choose_variants, prep_bNMF, run_bNMF, post_bNMF)
-scripts_dir <- working_dir
-
-# LDlink API token — register at https://ldlink.nci.nih.gov/?tab=apiaccess
-# Replace with your own token before running LD pruning steps.
-my_LDlink_token <- Sys.getenv("LDLINK_TOKEN", unset = "YOUR_LDLINK_TOKEN_HERE")
-
-# Variant selection thresholds
-# PVCUTOFF:       genome-wide significance — defines sentinel variants and the LD-pruning input
-# PVCUTOFF_PROXY: suggestive threshold — broader pool for proxy candidate fetch
-#                 (set equal to PVCUTOFF to disable the wider pool)
-# PROXY_WINDOW_KB: half-window around each sentinel (kb) for proxy candidate fetch;
-#                  only variants within this window of a sentinel are fetched, keeping
-#                  the z-score grid tractable even for highly polygenic traits (BMI, T2D)
-PVCUTOFF          <- 5e-8
-PVCUTOFF_PROXY    <- 5e-6
-PROXY_WINDOW_KB   <- 500
-
-# Directory containing per-chromosome rsID→position map files (used by choose_proxies)
-# Each file should be named chr{N}.txt with columns: hg19_posID, rsID, ref_allele, alt_allele
-my_rsid_map_dir <- "rsid_maps_by_chr"
-
-# Column rename map for your primary GWAS summary stats file (if column names differ from
-# the pipeline defaults: P_VALUE, BETA, SE, ODDS_RATIO). Set to NULL if no renaming needed.
-# Example: rename_cols <- c(P_VALUE = "P_FIRTH_FE_IV", ODDS_RATIO = "OR_FIRTH_FE_IV")
-rename_cols <- NULL
-
-# Path to hg19→hg38 liftover chain file (required for post-hoc analysis and TOPMed audit)
-# Download from: https://hgdownload.soe.ucsc.edu/goldenPath/hg19/liftOver/
-hg19_to_hg38_chain_file <- file.path(working_dir, "hg19ToHg38.over.chain")
-
-# TOPMed presence filter (optional)
-# When TRUE, variants not found in TOPMed are flagged for proxy replacement, and all
-# proxy candidates are restricted to TOPMed-confirmed positions — ensuring the final
-# variant set is fully genotyped in TOPMed (improves PRS portability).
-# Requires: BRAVO per-chromosome VCF files (chr*.bravo.pub.vcf.gz + .tbi index).
-# Download from: https://bravo.sph.umich.edu/freeze10/hg38/
-USE_TOPMED_FILTER <- FALSE
-bravo_dir         <- "/humgen/florezlab/users/ksmith/BRAVO"
-
-# ---- END USER CONFIGURATION ----
-
-setwd(working_dir)
-
-# Derived output paths
-main_dir      <- file.path(working_dir, paste0(version, "_results"))
-main_dir_shrt <- basename(main_dir)
-dir.create(main_dir, recursive = TRUE)
-
-# Checkpoint file for saving R workspace between steps
-df_save <- sprintf("my_workspace_%s.RData", version)
-
-# Uncomment to resume from a saved checkpoint:
-# load(df_save)
-
-
-# =====================
-# 1. Source Helper Scripts & Load GWAS Manifest
-# =====================
-
-source(file.path(scripts_dir, "choose_variants_2025.R"))  # LD pruning, clumping, proxy search
-source(file.path(scripts_dir, "prep_bNMF_2025.R"))        # Summary stats fetch & z-matrix prep
-source(file.path(scripts_dir, "run_bNMF_2025.R"))         # bNMF execution & summarization
-source(file.path(scripts_dir, "post_bNMF_2025.R"))        # Post-hoc cluster analysis
-
-select <- dplyr::select  # prevent namespace collision with other packages
-
-# Load GWAS manifest
-
-gwas <- read_excel(gwas_file, sheet = "main_gwas") %>%
-  mutate(ID = paste(study, trait, population, sep = "_")) %>%
-  drop_na(full_path)
-# Note: gwas$full_path should point to summary statistic files on your system.
-
-gwas_traits      <- read_excel(gwas_file, sheet = "trait_gwas") %>% drop_na(full_path)
-main_ss_filepath <- gwas$full_path[gwas$largest == "Yes"]
-
-# Named file vectors
-gwas_ss_files      <- setNames(gwas$full_path, gwas$ID)
-trait_ss_files     <- setNames(gwas_traits$full_path, gwas_traits$trait)
-trait_ss_size      <- setNames(gwas_traits$sample_size, gwas_traits$trait)
-
-# Sanity check: missing trait files
-for (f in trait_ss_files) {
-  if (!file.exists(f)) message("Missing trait file: ", f)
+# Find the repository from this script's location. This lets the example work
+# whether it is run from the repository root or as:
+#   Rscript scripts/main_script_example.R
+script_arg <- grep("^--file=", commandArgs(trailingOnly = FALSE), value = TRUE)
+if (length(script_arg) == 1L) {
+  script_file <- normalizePath(sub("^--file=", "", script_arg), mustWork = TRUE)
+} else if (!is.null(sys.frames()[[1L]]$ofile)) {
+  script_file <- normalizePath(sys.frames()[[1L]]$ofile, mustWork = TRUE)
+} else {
+  script_file <- normalizePath(file.path("scripts", "main_script_example.R"),
+                               mustWork = TRUE)
 }
 
-# =====================
-# 2. Variant Selection & Clumping
-# =====================
-# NOTE: Steps 2-3 perform LD pruning via the LDlink API and may take several
-# hours. Results are saved to disk via save.image() so you can resume from a
-# checkpoint without re-running. If you already have pruned_vars, load the
-# saved workspace and skip to Section 4.
+repo_dir <- normalizePath(file.path(dirname(script_file), ".."), mustWork = TRUE)
+example_dir <- file.path(repo_dir, "example_data")
+scripts_dir <- file.path(repo_dir, "scripts")
 
-start_time <- Sys.time()
+version <- "toy_bnmf_example"
+main_dir <- file.path(repo_dir, paste0(version, "_results"))
+dir.create(main_dir, recursive = TRUE, showWarnings = FALSE)
 
-# 2.1 Identify suggestive SNPs (PVCUTOFF_PROXY) as the broad proxy candidate pool.
-#     The wider threshold gives the downstream proxy search more flexibility:
-#     if a sentinel needs a proxy, any sub-threshold variant in its neighbourhood
-#     is already fetched and evaluated.
+# Variant-selection settings.
+PVCUTOFF <- 5e-8
+PVCUTOFF_PROXY <- 5e-6
+PROXY_WINDOW_KB <- 500
+CLUMP_WINDOW_BP <- 100e3
+
+# External LD operations are disabled for the self-contained toy run.
+RUN_LDLINK_PRUNING <- FALSE
+RUN_PROXY_SEARCH <- FALSE
+LD_POPS <- c("EUR", "EAS", "AFR", "AMR", "SAS")
+LD_R2 <- 0.05
+LD_MAF <- 0.001
+LDLINK_TOKEN <- Sys.getenv("LDLINK_TOKEN", unset = "")
+
+# Proxy search additionally requires files named chrN.txt with four columns:
+# hg19 position (chrN:position), rsID, reference allele, alternate allele.
+RSID_MAP_DIR <- file.path(example_dir, "rsid_maps_by_chr")
+PROXY_MIN_NONMISSING <- 0.8
+PROXY_MIN_R2 <- 0.8
+
+# Trait and bNMF settings.
+MIN_MEDIAN_N <- 5000
+MAX_TRAIT_MISSING <- 0.30
+CORRELATION_CUTOFF <- 0.8
+IMPUTATION_HOLDOUT <- 0.10
+RANDOM_SEED <- 123
+
+BNMF_REPS <- 10
+BNMF_K_INITIAL <- 15
+BNMF_K0 <- 10
+BNMF_TOLERANCE <- 1e-6
+BNMF_PHI <- 1
+BNMF_WORKERS <- max(1L, min(2L, parallelly::availableCores()))
+
+if (RUN_PROXY_SEARCH && !RUN_LDLINK_PRUNING) {
+  stop("RUN_PROXY_SEARCH requires RUN_LDLINK_PRUNING so original rsIDs are available.")
+}
+if ((RUN_LDLINK_PRUNING || RUN_PROXY_SEARCH) && !nzchar(LDLINK_TOKEN)) {
+  stop("Set the LDLINK_TOKEN environment variable before enabling LDlink steps.")
+}
+if (RUN_PROXY_SEARCH && !dir.exists(RSID_MAP_DIR)) {
+  stop("Proxy search requires a current per-chromosome rsID map directory: ",
+       RSID_MAP_DIR)
+}
+
+# =============================================================================
+# 1. Load helper functions and toy manifest
+# =============================================================================
+
+source(file.path(scripts_dir, "choose_variants_2025.R"))
+source(file.path(scripts_dir, "prep_bNMF_2025.R"))
+source(file.path(scripts_dir, "run_bNMF_2025.R"))
+future::plan(future::sequential)
+
+manifest_file <- file.path(example_dir, "clustering_data_source_example.xlsx")
+gwas <- read_excel(manifest_file, sheet = "main_gwas") %>%
+  mutate(
+    ID = paste(study, trait, population, sep = "_"),
+    # Resolve the example paths from the repository rather than trusting the
+    # working directory encoded in the workbook.
+    full_path = file.path(example_dir, "my_GWAS", basename(file))
+  )
+
+gwas_traits <- read_excel(manifest_file, sheet = "trait_gwas") %>%
+  mutate(full_path = file.path(example_dir, "my_GWAS", basename(file)))
+
+input_files <- c(gwas$full_path, gwas_traits$full_path)
+missing_files <- input_files[!file.exists(input_files)]
+if (length(missing_files) > 0L) {
+  stop("Missing toy summary-statistics file(s): ",
+       paste(missing_files, collapse = ", "))
+}
+
+main_rows <- which(toupper(gwas$largest) == "YES")
+if (length(main_rows) != 1L) {
+  stop("The main_gwas sheet must mark exactly one row as largest = 'Yes'.")
+}
+main_ss_filepath <- gwas$full_path[main_rows]
+
+trait_ss_files <- setNames(gwas_traits$full_path, gwas_traits$trait)
+trait_ss_size <- setNames(as.numeric(gwas_traits$sample_size), gwas_traits$trait)
+
+# =============================================================================
+# 2. Select and position-clump sentinel variants
+# =============================================================================
+
+# The broad set supplies possible proxy candidates. Sentinel eligibility is
+# still determined using each discovery GWAS's p-value and PVCUTOFF below.
 vars_sig <- get_sig_snps(
-  gwas         = gwas,
-  rename_cols  = rename_cols,  # set in USER CONFIGURATION above; NULL if no renaming needed
-  PVCUTOFF     = PVCUTOFF_PROXY    # broad pool; pruning step enforces PVCUTOFF
+  gwas = gwas,
+  rename_cols = NULL,
+  PVCUTOFF = PVCUTOFF_PROXY
 ) %>%
-  mutate(PVALUE = ifelse(PVALUE == 0, 1e-300, PVALUE))
-message("Total suggestive SNPs (P < PVCUTOFF_PROXY): ", nrow(vars_sig))
+  mutate(PVALUE = if_else(PVALUE == 0, 1e-300, PVALUE))
 
-
-# 2.2 Main-study variant set
-tmp_main <- get_biggest_gwas(main_ss_filepath, vars_sig)
-save.image(file = df_save)
-
-# 2.3 Remove HLA region
-vars_noHLA <- tmp_main %>%
-  mutate(across(c(CHR, POS), as.integer)) %>%
-  filter(!(CHR == 6 & between(POS, 28477797, 33448354)))
-message("After HLA removal: ", nrow(vars_noHLA))
-save.image(file = df_save)
-
-# 2.4 SNP clumping — restrict to sentinel-level variants (PVCUTOFF) before clumping
-#     so LDlinkR only processes genome-wide significant hits, not the full 5e-6 pool.
-vars_noHLA_sentinel <- vars_noHLA %>% filter(PVALUE < PVCUTOFF)
-message("Sentinel variants (P < PVCUTOFF) before clumping: ", nrow(vars_noHLA_sentinel))
-clumped_ids <- snp_clump(vars_noHLA_sentinel, window = 100e3, id = 'VAR_ID')
-vars_clumped <- vars_noHLA_sentinel %>% filter(VAR_ID %in% clumped_ids)
-message("Variants after clumping: ", nrow(vars_clumped))
-save.image(file = df_save)
-
-# =====================
-# 3. LD Pruning (LDlink SNPclip, multi-population)
-# =====================
-
-my_pops <- c("EUR","EAS","AFR","AMR","SAS")
-
-for (LD_pop in my_pops) {
-  print(cat(sprintf("\n\nLD-pruning using %s panel in LDlink::SNPclip...", LD_pop)))
-  ld_pruning_SNP.clip(df_snps = vars_clumped,
-                      pop = LD_pop,
-                      output_dir = main_dir_shrt,
-                      r2 = 0.05,
-                      maf=0.001,
-                      chr = 22:1,
-                      token = my_LDlink_token)
+# Normalize the designated primary GWAS in memory. This works for both the
+# uncompressed toy file and real data supplied as a data frame to
+# fetch_summary_stats().
+gwas_primary <- fread(main_ss_filepath, data.table = FALSE)
+if (!"BETA" %in% names(gwas_primary)) {
+  gwas_primary <- gwas_primary %>%
+    mutate(BETA = log(as.numeric(ODDS_RATIO)))
 }
-print("Done!")
-save.image(file = df_save)
+if (!"SE" %in% names(gwas_primary)) {
+  gwas_primary <- gwas_primary %>%
+    mutate(SE = abs(BETA / qnorm(pmax(as.numeric(P_VALUE),
+                                     .Machine$double.xmin) / 2)))
+}
+gwas_primary <- gwas_primary %>%
+  mutate(P_VALUE = as.numeric(P_VALUE), BETA = as.numeric(BETA), SE = as.numeric(SE)) %>%
+  separate(VAR_ID, into = c("CHR", "POS", "REF", "ALT"),
+           sep = "_", remove = FALSE, convert = TRUE) %>%
+  mutate(SNP = paste(CHR, POS, sep = ":"))
 
-# Combine LD-pruning results
-num_pops <- length(my_pops)
+primary_pvalues <- gwas_primary %>%
+  transmute(VAR_ID, PVALUE = P_VALUE)
 
-print("Combining SNP.clip results...")
-ld_files <- list.files(path=main_dir_shrt,
-                       pattern = "^snpClip_results",
-                       full.names = T)
+# Mirror get_biggest_gwas(): retain the strongest discovery record for each
+# variant, then require the variant to be represented in the primary GWAS.
+vars_main <- vars_sig %>%
+  arrange(PVALUE) %>%
+  distinct(VAR_ID, .keep_all = TRUE) %>%
+  rename(PVALUE.Pop = PVALUE) %>%
+  inner_join(primary_pvalues, by = "VAR_ID") %>%
+  separate(VAR_ID, into = c("CHR", "POS", "REF.primary", "ALT.primary"),
+           sep = "_", remove = FALSE, convert = TRUE) %>%
+  mutate(
+    REF = REF.primary,
+    ALT = ALT.primary,
+    ChrPos = paste(CHR, POS, sep = ":"),
+    ChrPos_LDlink = paste0("chr", ChrPos)
+  ) %>%
+  select(-REF.primary, -ALT.primary)
 
-my_ChrPos <- vars_clumped$ChrPos
-print(sprintf("Starting with %i SNPs...", length(my_ChrPos)))
+vars_no_hla <- vars_main %>%
+  filter(!(CHR == 6 & between(POS, 28477797, 33448354)))
 
-df_clipped_kept_all    <- data.frame()
-df_clipped_removed_all <- data.frame()
-df_missing_1000G       <- data.frame()
-df_low_MAF_1000G       <- data.frame()
+sentinel_candidates <- vars_no_hla %>%
+  filter(PVALUE.Pop < PVCUTOFF)
+if (nrow(sentinel_candidates) == 0L) {
+  stop("No sentinel variants passed PVCUTOFF.")
+}
 
-ld_cols <- c("RS_Number","Position","Alleles","Details","Population")
-for (pop in my_pops) {
-  print(pop)
-  df_clipped_res <- data.frame(RS_Number=character(), Position=character(),
-                                Alleles=character(), Details=character(),
-                                Population=character())
-  rename_cols_clipped <- c(RS_Number="RS Number")
+clumped_ids <- snp_clump(
+  sentinel_candidates,
+  id = "VAR_ID",
+  window = CLUMP_WINDOW_BP
+)
+vars_clumped <- sentinel_candidates %>%
+  filter(VAR_ID %in% clumped_ids)
 
-  ld_files_tmp <- ld_files[grepl(pop, ld_files)]
-  print(length(ld_files_tmp) == 22)
+message(sprintf(
+  "Variant selection: %d broad candidates, %d sentinels, %d after position clumping.",
+  nrow(vars_no_hla), nrow(sentinel_candidates), nrow(vars_clumped)
+))
 
-  for (ld_file in ld_files_tmp) {
-    df <- fread(ld_file, stringsAsFactors = FALSE, data.table = FALSE) %>%
-      dplyr::rename(any_of(rename_cols_clipped)) %>%
-      mutate(Population = pop)
-    if (!all(ld_cols %in% names(df)))
-      print(sprintf("%s missing columns!", str_after_last(ld_file, "results_")))
-    df_clipped_res <- rbind(df_clipped_res, df)
+# =============================================================================
+# 3. Optional LDlink pruning
+# =============================================================================
+
+if (RUN_LDLINK_PRUNING) {
+  ld_result_dir <- file.path(main_dir, "ld_pruning")
+  dir.create(ld_result_dir, recursive = TRUE, showWarnings = FALSE)
+
+  for (ld_pop in LD_POPS) {
+    ld_pruning_SNP.clip(
+      df_snps = vars_clumped,
+      pop = ld_pop,
+      output_dir = ld_result_dir,
+      r2 = LD_R2,
+      maf = LD_MAF,
+      chr = 1:22,
+      token = LDLINK_TOKEN
+    )
   }
 
-  df_clipped_kept    <- df_clipped_res %>% filter(Details == "Variant kept.")
-  df_clipped_removed <- df_clipped_res %>% filter(Details != "Variant kept.")
-  print(sprintf("%i SNPs kept and %i removed for %s",
-                nrow(df_clipped_kept), nrow(df_clipped_removed), pop))
+  # Read the explicitly named outputs. This also makes a missing or failed
+  # population a hard error instead of silently treating its variants as absent.
+  ld_by_pop <- lapply(LD_POPS, function(ld_pop) {
+    files <- list.files(
+      ld_result_dir,
+      pattern = paste0("^snpClip_results_", ld_pop, "_chr[0-9]+\\.txt$"),
+      full.names = TRUE
+    )
+    if (length(files) == 0L) {
+      stop("No successful SNPclip outputs found for population ", ld_pop, ".")
+    }
+    bind_rows(lapply(files, fread)) %>%
+      rename(RS_Number = any_of("RS Number")) %>%
+      mutate(LD_population = ld_pop)
+  })
 
-  df_clipped_kept_all    <- rbind(df_clipped_kept_all,    df_clipped_kept)
-  df_clipped_removed_all <- rbind(df_clipped_removed_all, df_clipped_removed)
+  ld_kept <- bind_rows(ld_by_pop) %>%
+    filter(Details == "Variant kept.")
+
+  kept_in_every_panel <- ld_kept %>%
+    distinct(Position, RS_Number, LD_population) %>%
+    count(Position, RS_Number, name = "n_pop") %>%
+    filter(n_pop == length(LD_POPS))
+
+  pruned_vars <- vars_clumped %>%
+    inner_join(kept_in_every_panel,
+               by = c("ChrPos_LDlink" = "Position")) %>%
+    select(-n_pop)
+} else {
+  message("LDlink pruning is disabled; using position-clumped toy sentinels.")
+  pruned_vars <- vars_clumped %>%
+    mutate(RS_Number = NA_character_)
 }
 
-# variant counts per reference panel
-df_clipped_kept_all %>% count(Population)
+if (nrow(pruned_vars) == 0L) {
+  stop("No variants remain after pruning.")
+}
 
-# Keep only variants that passed pruning in ALL populations
-num_independent_pops <- df_clipped_kept_all %>%
-  count(Position) %>%
-  group_by(n)
+# =============================================================================
+# 4. Fetch and harmonize the multi-trait summary statistics
+# =============================================================================
 
-kept_in_all_pops <- num_independent_pops %>%
-  filter(n == num_pops) %>%
-  inner_join(df_clipped_kept_all[, c('RS_Number', 'Position')], by = 'Position') %>%
-  distinct(RS_Number, .keep_all = TRUE)
-
-pruned_vars <- vars_clumped %>%
-  mutate(SNP = ChrPos, ChrPos = gsub("chr", "", ChrPos)) %>%
-  inner_join(kept_in_all_pops, by = c('SNP' = 'Position'))
-
-print(sprintf("Sig. SNPs pruned from %i to %i...", nrow(vars_clumped), nrow(pruned_vars)))
-save.image(file = df_save)
-
-# =====================
-# 4. Summary Stats Fetch & Missingness
-# =====================
-
-# 4.1 Build proxy candidate pool: restrict vars_noHLA (P < PVCUTOFF_PROXY) to
-#     variants within PROXY_WINDOW_KB of a LD-pruned sentinel. This keeps the
-#     fetch tractable for highly polygenic traits (BMI, T2D) while ensuring any
-#     proxy LDlinkR might return is already in the fetched grid.
 fetch_input <- window_to_sentinels(
-  candidates = vars_noHLA %>%
-    separate(VAR_ID, into = c("CHR","POS","REF","ALT"), sep = "_", remove = FALSE) %>%
-    mutate(ChrPos = paste(CHR, POS, sep = ":")) %>%
-    arrange(PVALUE) %>%
-    distinct(ChrPos, .keep_all = TRUE),
-  sentinels  = pruned_vars,
-  window_kb  = PROXY_WINDOW_KB
+  candidates = vars_no_hla,
+  sentinels = pruned_vars,
+  window_kb = PROXY_WINDOW_KB
 ) %>%
-  rename(SNP = ChrPos)
-message("Proxy candidate pool (windowed fetch input): ", nrow(fetch_input), " variants")
-#
-# # 4.2 Single fetch across all traits — provides z-scores AND missingness for
-# #     both sentinel variants and any proxy that might be needed.
-# z_n_mats <- fetch_summary_stats(
-#   df_input          = fetch_input,
-#   gwas_ss_file      = main_ss_filepath,
-#   trait_ss_files    = trait_ss_files,
-#   trait_ss_size     = trait_ss_size,
-#   pval_cutoff       = 0.05,
-#   read_trait_method = 'datatable'
-# )
-# save.image(file = df_save)
-# 
-# # #----
-#
-# 
-zmat0 <- z_n_mats$df_z
-Nmat0 <- z_n_mats$df_N
+  mutate(SNP = ChrPos) %>%
+  arrange(PVALUE) %>%
+  distinct(SNP, .keep_all = TRUE)
 
-# Filter traits based on sample size and missingness
-med_N <- apply(Nmat0, 2, median, na.rm = TRUE)
-big_N_traits <- names(med_N)[med_N > 5000]
-zmat1 <- zmat0[, big_N_traits]
+pval_bonf_sentinel <- 0.05 / nrow(pruned_vars)
+trait_checkpoint_dir <- file.path(main_dir, "trait_checkpoints")
 
-# FIND TRAITS MISSING >30% OF SNPs
-traits_highMissing <- names(colSums(is.na(zmat1)))[colSums(is.na(zmat1)) > (nrow(zmat1) * 0.3)]
-traits_lowMissing <- setdiff(big_N_traits, traits_highMissing)
-
-df_zmat_fullset <- z_n_mats$df_z[, traits_lowMissing]
-trait_ss_files_filtered <- trait_ss_files[traits_lowMissing]
-trait_ss_size_filtered <- trait_ss_size[traits_lowMissing]
-
-# Variant-level non-missingness calculation
-var_counts <- df_zmat_fullset %>%
-  rownames_to_column('ChrPos') %>%
-  inner_join(pruned_vars[,c("ChrPos","VAR_ID")], by="ChrPos") %>%
-  mutate(frac = rowSums(!is.na(dplyr::select(., all_of(traits_lowMissing)))) / length(traits_lowMissing))
-nonmiss_frac <- setNames(var_counts$frac, var_counts$VAR_ID)
-
-# QC CHECK 1: Verify all pruned variants got missingness calculated
-message("QC Check 1: Missingness calculation coverage")
-missing_frac_coverage <- length(nonmiss_frac) / nrow(pruned_vars)
-message(sprintf("  ✓ Missingness calculated for %d/%d pruned variants (%.1f%%)",
-                length(nonmiss_frac), nrow(pruned_vars), missing_frac_coverage * 100))
-
-if (missing_frac_coverage < 0.95) {
-  warning("Less than 95% of pruned variants have missingness data!")
-}
-
-save.image(file = df_save)
-
-# =====================
-# 5. TOPMed Audit (optional)
-# =====================
-# Checks pruned_vars and the proxy candidate pool against TOPMed BRAVO VCFs.
-# Requires USE_TOPMED_FILTER = TRUE and bravo_dir pointing to chr*.bravo.pub.vcf.gz files.
-# Produces:
-#   topmed_fails        — VAR_IDs in pruned_vars absent from TOPMed (fed to find_variants_needing_proxies)
-#   topmed_present_snps — hg19 ChrPos values in the proxy candidate pool confirmed in TOPMed
-#                         (fed to choose_proxies to restrict all proxy selection to TOPMed variants)
-
-if (USE_TOPMED_FILTER) {
-  message("=== TOPMED AUDIT ===")
-
-  # 5a. Check pruned_vars against TOPMed
-  topmed_confirmed_pruned <- check_topmed_presence(
-    variants_hg19 = pruned_vars %>%
-      mutate(CHR = as.character(CHR), POS = as.integer(POS)) %>%
-      select(VAR_ID, CHR, POS),
-    chain_file    = hg19_to_hg38_chain_file,
-    vcf_dir       = bravo_dir
-  )
-  topmed_fails <- pruned_vars$VAR_ID[!pruned_vars$VAR_ID %in% topmed_confirmed_pruned]
-  message(sprintf("  %d / %d pruned variants absent from TOPMed (will be flagged for proxy search)",
-                  length(topmed_fails), nrow(pruned_vars)))
-
-  # 5b. Check proxy candidate pool (fetch_input) against TOPMed
-  #     Only variants confirmed here are eligible as proxies for any variant
-  message("  Checking proxy candidate pool against TOPMed...")
-  proxy_candidates_hg19 <- fetch_input %>%
-    mutate(CHR = as.character(CHR), POS = as.integer(POS)) %>%
-    select(VAR_ID, CHR, POS)
-
-  topmed_confirmed_proxies <- check_topmed_presence(
-    variants_hg19 = proxy_candidates_hg19,
-    chain_file    = hg19_to_hg38_chain_file,
-    vcf_dir       = bravo_dir
-  )
-  # Convert confirmed VAR_IDs back to ChrPos (zmat_fullset rowname format)
-  topmed_present_snps <- fetch_input$ChrPos[fetch_input$VAR_ID %in% topmed_confirmed_proxies]
-  message(sprintf("  %d / %d proxy candidates confirmed in TOPMed",
-                  length(topmed_present_snps), nrow(fetch_input)))
-
-} else {
-  topmed_fails        <- NULL
-  topmed_present_snps <- NULL
-}
-
-# =====================
-# 6. Identify Variants Needing Proxies
-# =====================
-
-message("=== IDENTIFYING VARIANTS NEEDING PROXIES ===")
-
-proxies_needed <- find_variants_needing_proxies(
-  gwas_variant_df    = pruned_vars,
-  var_nonmissingness = nonmiss_frac,
-  topmed_fails       = topmed_fails   # NULL if USE_TOPMED_FILTER = FALSE
+z_n_mats <- fetch_summary_stats(
+  df_input = fetch_input,
+  gwas_ss_file = gwas_primary,
+  trait_ss_files = trait_ss_files,
+  trait_ss_size = trait_ss_size,
+  pval_cutoff = 0.05,
+  pval_bonf = pval_bonf_sentinel,
+  checkpoint_dir = trait_checkpoint_dir
 )
 
-# QC CHECK 2: Verify all high-missingness variants are captured
-message("QC Check 2: High-missingness variant detection")
-high_missing_vars <- names(nonmiss_frac[nonmiss_frac < 0.8])
-missed_high_missing <- high_missing_vars[!high_missing_vars %in% proxies_needed$VAR_ID]
+zmat_fullset <- as.matrix(z_n_mats$df_z)
+Nmat_fullset <- as.matrix(z_n_mats$df_N)
 
-if (length(missed_high_missing) == 0) {
-  message("  ✓ All high-missingness variants correctly identified for proxy search")
-} else {
-  warning(sprintf("  ✗ %d high-missingness variants NOT in proxies_needed:", length(missed_high_missing)))
-  print(head(missed_high_missing))
+missing_sentinels <- setdiff(pruned_vars$ChrPos, rownames(zmat_fullset))
+if (length(missing_sentinels) > 0L) {
+  stop("No z-matrix row was created for sentinel(s): ",
+       paste(missing_sentinels, collapse = ", "))
 }
 
-# QC CHECK 3: Verify no problematic variants in non-proxy set
-message("QC Check 3: Problematic variant exclusion")
-non_proxy_vars <- pruned_vars %>% filter(!VAR_ID %in% proxies_needed$VAR_ID)
+zmat_pruned <- zmat_fullset[pruned_vars$ChrPos, , drop = FALSE]
+Nmat_pruned <- Nmat_fullset[pruned_vars$ChrPos, , drop = FALSE]
 
-# Check for ambiguous variants not flagged
-ambiguous_missed <- non_proxy_vars %>%
-  filter(paste0(REF, ALT) %in% c("AT", "TA", "CG", "GC")) %>%
-  nrow()
+median_N <- apply(Nmat_pruned, 2, median, na.rm = TRUE)
+traits_high_N <- names(median_N)[is.finite(median_N) & median_N >= MIN_MEDIAN_N]
+trait_missingness <- colMeans(is.na(zmat_pruned[, traits_high_N, drop = FALSE]))
+traits_final <- names(trait_missingness)[trait_missingness <= MAX_TRAIT_MISSING]
 
-# Check for multiallelic variants not flagged
-multiallelic_missed <- non_proxy_vars %>%
-  filter(grepl(",", ALT)) %>%
-  nrow()
-
-if (ambiguous_missed == 0 && multiallelic_missed == 0) {
-  message("  ✓ No ambiguous or multiallelic variants in non-proxy set")
-} else {
-  warning(sprintf("  ✗ Found %d ambiguous and %d multiallelic variants not flagged for proxy search",
-                  ambiguous_missed, multiallelic_missed))
+if (length(traits_final) < 2L) {
+  stop("Fewer than two traits remain after sample-size and missingness filtering.")
 }
 
-save.image(file = df_save)
-
-# =====================
-# 7. Proxy Search
-# =====================
-
-message("=== PROXY SEARCH ===")
-
-all_need_proxies <- proxies_needed %>%
-  inner_join(pruned_vars[,c("VAR_ID","Population")], by="VAR_ID")
-
-final_proxy_results <- choose_proxies(
-  need_proxies        = all_need_proxies,
-  rsid_map_dir        = my_rsid_map_dir,
-  zmat_fullset        = df_zmat_fullset,
-  pruned_variants     = pruned_vars,
-  token               = my_LDlink_token,
-  population          = "EUR",
-  frac_nonmissing_num = 0.8,
-  r2_num              = 0.8,
-  topmed_present_snps = topmed_present_snps   # NULL if USE_TOPMED_FILTER = FALSE
-)
-
-save.image(file = df_save)
-
-# =====================
-# 8. Final Variant Assembly
-# =====================
-proxy_not_needed_ids <- final_proxy_results[[1]]
-
-# final_proxy_results[[2]] is NULL when no proxies are found; produce empty frame in that case
-proxy_df <- if (!is.null(final_proxy_results[[2]]) && nrow(final_proxy_results[[2]]) > 0) {
-  final_proxy_results[[2]] %>%
-    select(ChrPos = proxy_ChrPos, rsID = proxy_rsID, A1 = REF, A2 = ALT, original_SNP = VAR_ID) %>%
-    inner_join(fetch_input, by = c('ChrPos' = 'SNP')) %>%
-    filter((A1 == REF & A2 == ALT) | (A2 == REF & A1 == ALT)) %>%
-    mutate(Variant_Type = "proxy") %>%
-    select(VAR_ID, ChrPos, rsID, Variant_Type, CHR, POS, REF, ALT, PVALUE, Risk_Allele, GWAS, Population, original_SNP)
-} else {
-  message("  No proxies found; proxy_df will be empty.")
-  data.frame(VAR_ID=character(), ChrPos=character(), rsID=character(), Variant_Type=character(),
-             CHR=character(), POS=character(), REF=character(), ALT=character(),
-             PVALUE=numeric(), Risk_Allele=character(), GWAS=character(),
-             Population=character(), original_SNP=character())
-}
-
-# Combine final variant set
-df_final <- pruned_vars %>%
-  filter(!VAR_ID %in% all_need_proxies$VAR_ID) %>%
-  mutate(Variant_Type="original", original_SNP=VAR_ID) %>%
-  select(VAR_ID, ChrPos, rsID=RS_Number, Variant_Type, CHR, POS, REF, ALT, PVALUE, Risk_Allele, GWAS, Population, original_SNP) %>%
-  rbind(proxy_df)
-
-# Create and save rsID mapping
-df_rsIDs <- df_final %>%
-  select(VAR_ID, rsID)
-
-write_delim(df_rsIDs, file.path(main_dir_shrt, "rsID_map.txt"), delim = "\t", col_names = TRUE)
-message(sprintf("  Written rsID map with %d variants to rsID_map.txt", nrow(df_rsIDs)))
-
-
-
-# QC CHECK 4: Verify variant accounting
-message("QC Check 4: Variant accounting")
-original_count <- nrow(pruned_vars)
-proxies_needed_count <- nrow(proxies_needed)
-proxies_found_count <- nrow(proxy_df)
-proxies_not_found <- proxies_needed_count - proxies_found_count
-final_count <- nrow(df_final)
-expected_final <- original_count - proxies_not_found
-
-message(sprintf("  Started with: %d pruned variants", original_count))
-message(sprintf("  Needed proxies: %d variants", proxies_needed_count))
-message(sprintf("  Found proxies: %d variants", proxies_found_count))
-message(sprintf("  Expected final: %d variants", expected_final))
-message(sprintf("  Actual final: %d variants", final_count))
-
-if (final_count == expected_final) {
-  message("  ✓ Variant accounting correct")
-} else {
-  warning(sprintf("  ✗ Variant accounting mismatch! Difference: %d", final_count - expected_final))
-}
-
-# =====================
-# 9. GWAS Alignment & Beta Check
-# =====================
-
-message("=== GWAS ALIGNMENT ===")
-
-variants_that_got_proxies <- proxy_df %>% distinct(original_SNP) %>% pull(original_SNP)
-variants_needing_proxies_no_solution <- all_need_proxies %>%
-  filter(!VAR_ID %in% variants_that_got_proxies)
-
-gwas_final_filtered <- z_n_mats$df_gwas %>%
-  select(SNP, Risk_Allele, Nonrisk_Allele, P_VALUE, BETA, SE) %>%
-  inner_join(df_final, by = c('SNP'='ChrPos')) %>%
-  mutate(BETA_aligned = case_when(
-    ALT == Risk_Allele.x ~ BETA,
-    REF == Risk_Allele.x ~ -BETA,
-    TRUE ~ NA_real_
-  )) %>%
-  select(VAR_ID, ChrPos=SNP, rsID, REF, ALT, Risk_Allele=Risk_Allele.x, P_VALUE, SE, BETA, BETA_aligned)
-
-write_csv(gwas_final_filtered, file.path(main_dir_shrt, "alignment_GWAS_summStats.csv"))
-message(sprintf("  Written aligned GWAS summary stats with %d variants to alignment_GWAS_summStats.csv", nrow(gwas_final_filtered)))
-
-
-# QC CHECK 5: Beta alignment verification
-message("QC Check 5: Beta alignment")
-positive_betas <- all(gwas_final_filtered$BETA_aligned > 0, na.rm = TRUE)
-na_betas <- sum(is.na(gwas_final_filtered$BETA_aligned))
-
-if (positive_betas && na_betas == 0) {
-  message("  ✓ All BETA_aligned values are positive")
-} else {
-  warning(sprintf("  ✗ Beta alignment issues: %d NA values, all positive = %s",
-                  na_betas, positive_betas))
-}
-
-# QC CHECK 6: Final problematic variant verification
-message("QC Check 6: Final dataset quality")
-final_ambiguous <- gwas_final_filtered %>%
-  filter(paste0(REF, ALT) %in% c("AT", "TA", "CG", "GC")) %>%
-  nrow()
-
-final_multiallelic <- gwas_final_filtered %>%
-  filter(grepl(",", ALT)) %>%
-  nrow()
-
-if (final_ambiguous == 0 && final_multiallelic == 0) {
-  message("  ✓ No ambiguous or multiallelic variants in final dataset")
-} else {
-  warning(sprintf("  ✗ Final dataset contains %d ambiguous and %d multiallelic variants",
-                  final_ambiguous, final_multiallelic))
-}
-
-# =====================
-# 10. Generate QC Summary Report
-# =====================
-
-qc_summary <- list(
-  timestamp = Sys.time(),
-  version = version,
-
-  # Variant counts
-  pruned_variants = nrow(pruned_vars),
-  proxies_needed = nrow(proxies_needed),
-  proxies_found = nrow(proxy_df),
-  final_variants = nrow(gwas_final_filtered),
-
-  # QC results
-  missingness_coverage = missing_frac_coverage,
-  missed_high_missing = length(missed_high_missing),
-  ambiguous_missed = ambiguous_missed,
-  multiallelic_missed = multiallelic_missed,
-  accounting_correct = (final_count == expected_final),
-  all_betas_positive = positive_betas,
-  na_betas = na_betas,
-  final_ambiguous = final_ambiguous,
-  final_multiallelic = final_multiallelic,
-
-  # Trait filtering
-  total_traits = length(trait_ss_files),
-  big_N_traits = length(big_N_traits),
-  traits_high_missing = length(traits_highMissing),
-  traits_final = length(traits_lowMissing)
-)
-
-saveRDS(qc_summary, file.path(main_dir, "qc_summary.rds"))
-
-# Write human-readable QC report
-qc_report_file <- file.path(main_dir, "quality_control_report.txt")
-cat("=== QUALITY CONTROL REPORT ===\n", file = qc_report_file)
-cat(sprintf("Generated: %s\n", Sys.time()), file = qc_report_file, append = TRUE)
-cat(sprintf("Version: %s\n\n", version), file = qc_report_file, append = TRUE)
-
-cat("VARIANT PROCESSING:\n", file = qc_report_file, append = TRUE)
-cat(sprintf("  Pruned variants: %d\n", qc_summary$pruned_variants), file = qc_report_file, append = TRUE)
-cat(sprintf("  Proxies needed: %d\n", qc_summary$proxies_needed), file = qc_report_file, append = TRUE)
-cat(sprintf("  Proxies found: %d\n", qc_summary$proxies_found), file = qc_report_file, append = TRUE)
-cat(sprintf("  Final variants: %d\n\n", qc_summary$final_variants), file = qc_report_file, append = TRUE)
-
-cat("QUALITY CHECKS:\n", file = qc_report_file, append = TRUE)
-cat(sprintf("  ✓ Missingness coverage: %.1f%%\n", qc_summary$missingness_coverage * 100), file = qc_report_file, append = TRUE)
-cat(sprintf("  ✓ All high-missing captured: %s\n", ifelse(qc_summary$missed_high_missing == 0, "PASS", "FAIL")), file = qc_report_file, append = TRUE)
-cat(sprintf("  ✓ Variant accounting correct: %s\n", ifelse(qc_summary$accounting_correct, "PASS", "FAIL")), file = qc_report_file, append = TRUE)
-cat(sprintf("  ✓ All BETAs positive: %s\n", ifelse(qc_summary$all_betas_positive, "PASS", "FAIL")), file = qc_report_file, append = TRUE)
-cat(sprintf("  ✓ No problematic variants in final set: %s\n", ifelse(qc_summary$final_ambiguous == 0 && qc_summary$final_multiallelic == 0, "PASS", "FAIL")), file = qc_report_file, append = TRUE)
-
-message(sprintf("QC report written to: %s", qc_report_file))
-
-
-# =====================
-# 11. Imputation & Cross-Validation
-# =====================
-
-print("Imputing missing variant-trait data...")
-
-# Simple approach - use gwas_final_filtered ChrPos to subset the matrices
-zmat_preImputed <- z_n_mats$df_z[gwas_final_filtered$ChrPos, traits_lowMissing]
-Nmat_preImputed <- z_n_mats$df_N[gwas_final_filtered$ChrPos, traits_lowMissing]
-
-obs_mask <- !is.na(zmat_preImputed)
-set.seed(123)
-
-# Create CV holdouts
-i_dx <- which(obs_mask, arr.ind = TRUE)
-holdout_n <- floor(0.1 * nrow(i_dx))
-cv_idx <- i_dx[sample(nrow(i_dx), holdout_n), ]
-
-zmat_cv <- zmat_preImputed
-zmat_cv[cv_idx] <- NA
-
-# Lambda grid search
-lam0 <- lambda0(zmat_preImputed)
-lambda_grid <- seq(0.1 * lam0, lam0 + 0.2, length.out = 10)
-errors <- sapply(lambda_grid, function(l) {
-  fit <- softImpute(zmat_cv, rank.max = 50, lambda = l, type = 'svd')
-  imp <- softImpute::complete(zmat_cv, fit)
-  sqrt(mean((zmat_preImputed[cv_idx] - imp[cv_idx])^2, na.rm = TRUE))
-})
-best_lambda <- lambda_grid[which.min(errors)]
-message('Best lambda:', best_lambda)
-
-# Final imputation fits
-final_fit <- softImpute(zmat_preImputed, rank.max = 50, lambda = best_lambda, type = 'svd')
-z_imputed <- softImpute::complete(zmat_preImputed, final_fit)
-N_imputed <- apply(Nmat_preImputed, 2, function(x) replace(x, is.na(x), median(x, na.rm = TRUE)))
-
-save.image(file = df_save)
-
-# =====================
-# 12. Visualization of Imputation Results
-# =====================
-
-print("Visualizing softImpute results...")
-dist_long <- as.data.frame(z_imputed) %>%
-  mutate(row_id = row_number()) %>%
-  pivot_longer(-row_id, names_to = 'trait', values_to = 'value')
-was_imp   <- as.data.frame(is.na(zmat_preImputed)) %>%
-  mutate(row_id = row_number()) %>%
-  pivot_longer(-row_id, names_to = 'trait', values_to = 'imputed')
-dist_data <- left_join(dist_long, was_imp, by = c('row_id','trait'))
-
-dist_data %>%
-  ggplot(aes(x = value, color = imputed)) +
-  geom_density() +
-  labs(
-    x     = "Z-score",
-    color = "Imputed?",
-    title = "Density of Observed vs. Imputed Z-scores"
-  ) +
-  theme_minimal() +
-  xlim(-5, 5)   # zoom in on the bulk of the distribution
-
-# Build a little data.frame of CV holdouts
-cv_df <- data.frame(
-  true = zmat_preImputed[cv_idx],
-  imp  = z_imputed[cv_idx]
-)
-ggplot(cv_df, aes(x = true, y = imp)) +
-  geom_hex(bins = 50) +
-  geom_abline(linetype = "dashed") +
-  labs(x = "True Z", y = "Imputed Z",
-       title = "SoftImpute: True vs. Imputed on CV Holdouts") +
-  theme_minimal()
-
-# =====================
-# 13. bNMF Clustering
-# =====================
-
-# Prepare final z-matrix for bNMF
-prepped <- prep_z_matrix(
-  z_mat        = z_imputed,
-  N_mat        = N_imputed,
-  corr_cutoff  = 0.8
-)
-final_zscore_matrix <- as.matrix(prepped$final_z_mat)
-df_traits_filtered     <- prepped$df_traits
-
-# Optionally append traits that were removed upstream (e.g. low N) to the log.
-# Set remove_traits <- c("trait1", "trait2") before this block if needed.
-if (exists("remove_traits") && length(remove_traits) > 0) {
-  df_traits_filtered <- rbind(df_traits_filtered,
-                              data.frame(trait=remove_traits,
-                                         result="removed (low N)",
-                                         note=NA))
-}
-
-if (length(traits_highMissing)>0) {
-  df_traits_filtered <- rbind(df_traits_filtered,
-                              data.frame(trait=traits_highMissing,
-                                         result="removed (high missing)",
-                                         note=NA))
-}
-write_csv(x = df_traits_filtered,
-          file = file.path(main_dir_shrt,"df_traits.csv"))
-
-
-message(sprintf("Final matrix dimensions: %d SNPs x %d traits",
-                nrow(final_zscore_matrix), ncol(final_zscore_matrix)/2))
-
-#-----
-
-
-# Run bNMF (parallel)
-bnmf_start <- Sys.time()
-my_n_reps <- 100
-my_K <- 15
-my_K0 <- 10
-my_tolerance <- 1e-6
-my_phi <- 1
-
-my_bNMF_settings <- list(n_reps=my_n_reps,
-                         K=my_K,
-                         K0=my_K0,
-                         tolerance=my_tolerance,
-                         phi=my_phi)
-
-saveRDS(my_bNMF_settings,file.path(main_dir, "bnmf_settings.rds"))
-
-
-library(furrr)
-plan(multisession, workers = pmax(1, parallelly::availableCores() - 2))
-
-bnmf_out    <- run_bNMF_parallel(
-  final_zscore_matrix,
-  n_reps    = my_n_reps,
-  K         = my_K,
-  K0        = my_K0,
-  tolerance = my_tolerance,
-  phi       = my_phi,
-  random_seed = 123
-)
-bnmf_end <- Sys.time()
-message('bNMF runtime:', difftime(bnmf_end, bnmf_start, units = 'mins'))
-
-# Summarize results
-summarize_bNMF(bnmf_out, dir_save = main_dir)
-plan(sequential)  # reset parallel backend
-
-save.image(file = df_save)
-
-# ====================
-
-
-hg19_to_hg38_chain <- rtracklayer::import.chain(hg19_to_hg38_chain_file)
-
-cluster_post_hoc <- do_post_analysis(main_dir = main_dir,
-                                     df_gwas = gwas_final_filtered,
-                                     my_chain = hg19_to_hg38_chain,
-                                     make_excel = T,
-                                     do_liftover = T,
-                                     do_v2g = T)
-
-save.image(file = sprintf("my_workspace_%s.RData", version))
-
-saveRDS(cluster_post_hoc,file.path(main_dir, "cluster_post_hoc.rds"))
-saveRDS(zmat_preImputed,file.path(main_dir, "zmat_preImputed.rds"))
-saveRDS(z_imputed,file.path(main_dir, "zmat_imputed.rds"))
-
-
-
-#---  HTML ----
-
-
-k <- NULL
-if (is.null(k)){
-  html_filename <- paste0(version,"_maxK.html")
-} else {
-  html_filename <- sprintf("%s_K%i.html",version,k)
-}
-
-
-rmarkdown::render(
-  file.path(scripts_dir, "format_bNMF_results_2025.Rmd"),  # update filename as needed
-  output_file = html_filename,
-  output_dir = main_dir,
-  params = list(main_dir = main_dir)
-)
-
-
-#-----  trait table -----
-
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(stringr)   # for string matching
-
-# Step 1: Put all your trait names into a vector
-traits <- gwas_traits$file_name
-
-# Create a data frame
-df <- data.frame(trait = traits, stringsAsFactors = FALSE) %>%
-  mutate(
-    category = case_when(
-      str_detect(trait, regex("BMI|HEIGHT|WHR|WAIST|HIP|WHRadj|HIPCadj|WAISTadj", ignore_case = TRUE)) ~ "Anthropometry / General Obesity",
-      
-      str_detect(trait, regex("vat|asat|gfat|fat.*(percentage|trunk)|body fat|trunk fat|adiponectin|leptin", ignore_case = TRUE)) ~ "Body Composition / Fat Distribution",
-      
-      str_detect(trait, regex("ISI|IFC|HOMA|HOMAIR|FG|FI|HbA1c|Glucose|2hGlu|Incr30|Ins30|DI|CIR|STUM|INS|BIG|Proins|2hr", ignore_case = TRUE)) ~ "Glycemic / Insulin Resistance",
-      
-      str_detect(trait, regex("HDL|LDL|Cholesterol|TG|Apolipoprotein|Lipoprotein|TC", ignore_case = TRUE)) ~ "Lipids / Lipoproteins",
-      
-      str_detect(trait, regex("ALT|AST|ALP|GGT|Gamma.*glutamyl|bilirubin|crp|reactive", ignore_case = TRUE)) ~ "Liver Enzymes / Function",
-      
-      str_detect(trait, regex("RBC|WBC|platelet|neutrophil|lymphocyte|monocyte|basophil|eosinophil|reticulocyte|MCV| corpuscular|sphered|rheum|red|count|creat|cyst|haem|heart", ignore_case = TRUE)) ~ "Hematology / Blood Counts",
-      
-      str_detect(trait, regex("SBP|DBP|HR|blood pressure|vent|duration|pulse", ignore_case = TRUE)) ~ "Blood Pressure / Cardiovascular",
-      
-      str_detect(trait, regex("testosterone|oestradiol|SHBG|IGF|vitamin D|leptin|adiponectin", ignore_case = TRUE)) ~ "Hormones / Adipokines",
-      
-      str_detect(trait, regex("CRP|albumin|calcium|phosphate|urate|urea|total protein", ignore_case = TRUE)) ~ "Inflammation / Other Biomarkers",
-      
-      str_detect(trait, regex("basal metabolic|metabolic rate", ignore_case = TRUE)) ~ "Metabolic Rate",
-      
-      TRUE ~ "Other / Unclassified"
-    ),
-    
-    # Optional: extract base trait name without _female/_male/adjBMI for cleaner display
-    base_trait = str_remove(trait, "_female|_male|adjBMI|adjbmi"),
-    display_name = ifelse(str_detect(trait, "_female"), paste(base_trait, "(F)"),
-                          ifelse(str_detect(trait, "_male"), paste(base_trait, "(M)"), trait)),
-    display_name = str_wrap(gsub("_", " ", display_name), width = 20)
+traits_removed_low_N <- setdiff(colnames(zmat_pruned), traits_high_N)
+traits_removed_missing <- setdiff(traits_high_N, traits_final)
+
+variant_nonmissingness <- rowMeans(!is.na(zmat_pruned[, traits_final, drop = FALSE]))
+variant_nonmissingness <- setNames(variant_nonmissingness, pruned_vars$VAR_ID)
+
+# =============================================================================
+# 5. Optional proxy search and final variant assembly
+# =============================================================================
+
+if (RUN_PROXY_SEARCH) {
+  proxies_needed <- find_variants_needing_proxies(
+    gwas_variant_df = pruned_vars,
+    var_nonmissingness = variant_nonmissingness
   ) %>%
-  arrange(category)
+    inner_join(pruned_vars %>% select(VAR_ID, Population), by = "VAR_ID") %>%
+    mutate(
+      search_population = case_when(
+        Population %in% c("EUR", "TA", "MA") ~ "EUR",
+        Population == "SA" ~ "SAS",
+        TRUE ~ Population
+      )
+    )
 
-# Step 3: Create a grid-like colored table with ggplot (tile style)
-# Count per category to make reasonable number of columns
-n_per_row <- 8   # adjust to your liking
+  pruned_by_search_pop <- pruned_vars %>%
+    mutate(
+      search_population = case_when(
+        Population %in% c("EUR", "TA", "MA") ~ "EUR",
+        Population == "SA" ~ "SAS",
+        TRUE ~ Population
+      )
+    )
 
-df_plot <- df %>%
-  mutate(
-    category = factor(category),              # for ordering
-    row_id = row_number(),
-    col_id = (row_id - 1) %% n_per_row + 1,
-    row_group = (row_id - 1) %/% n_per_row + 1
+  supported_pops <- c("EUR", "EAS", "AFR", "AMR", "SAS")
+  proxy_pops <- unique(pruned_by_search_pop$search_population)
+  unsupported_pops <- setdiff(proxy_pops, supported_pops)
+  if (length(unsupported_pops) > 0L) {
+    stop("Unsupported LDlink proxy population(s): ",
+         paste(unsupported_pops, collapse = ", "))
+  }
+
+  proxy_sets <- lapply(proxy_pops, function(pop) {
+    needed_pop <- proxies_needed %>%
+      filter(search_population == pop) %>%
+      select(-search_population)
+    pruned_pop <- pruned_by_search_pop %>%
+      filter(search_population == pop) %>%
+      select(-search_population)
+
+    if (nrow(needed_pop) == 0L) {
+      return(list(pruned_pop$VAR_ID, NULL))
+    }
+
+    choose_proxies(
+      need_proxies = needed_pop,
+      rsid_map_dir = RSID_MAP_DIR,
+      pruned_variants = pruned_pop,
+      zmat_fullset = zmat_fullset[, traits_final, drop = FALSE],
+      token = LDLINK_TOKEN,
+      population = pop,
+      frac_nonmissing_num = PROXY_MIN_NONMISSING,
+      r2_num = PROXY_MIN_R2,
+      variant_metadata = fetch_input,
+      output_dir = file.path(main_dir, "proxy_search", pop)
+    )
+  })
+  names(proxy_sets) <- proxy_pops
+
+  original_ids <- unique(unlist(lapply(proxy_sets, `[[`, 1L)))
+  proxy_rows <- bind_rows(lapply(proxy_sets, `[[`, 2L))
+
+  final_originals <- pruned_vars %>%
+    filter(VAR_ID %in% original_ids) %>%
+    transmute(
+      VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
+      original_SNP = VAR_ID, REF, ALT, PVALUE, Risk_Allele, GWAS, Population
+    )
+
+  if (nrow(proxy_rows) > 0L) {
+    proxy_metadata <- fetch_input %>%
+      select(VAR_ID, SNP, REF, ALT, PVALUE, Risk_Allele, GWAS, Population) %>%
+      distinct(SNP, .keep_all = TRUE)
+
+    final_proxies <- proxy_rows %>%
+      transmute(
+        original_SNP = VAR_ID,
+        ChrPos = proxy_ChrPos,
+        rsID = proxy_rsID,
+        Variant_Type = "proxy"
+      ) %>%
+      inner_join(proxy_metadata, by = c("ChrPos" = "SNP")) %>%
+      select(VAR_ID, ChrPos, rsID, Variant_Type, original_SNP,
+             REF, ALT, PVALUE, Risk_Allele, GWAS, Population)
+  } else {
+    final_proxies <- final_originals[0, ]
+  }
+
+  final_snps <- bind_rows(final_originals, final_proxies)
+} else {
+  message("Proxy search is disabled; retaining all position/LD-pruned originals.")
+  final_snps <- pruned_vars %>%
+    transmute(
+      VAR_ID, ChrPos, rsID = RS_Number, Variant_Type = "original",
+      original_SNP = VAR_ID, REF, ALT, PVALUE, Risk_Allele, GWAS, Population
+    )
+}
+
+if (anyDuplicated(final_snps$original_SNP)) {
+  stop("Final assembly produced more than one retained variant for an original sentinel.")
+}
+if (!setequal(final_snps$original_SNP, pruned_vars$VAR_ID)) {
+  stop("Final assembly did not account for every pruned sentinel exactly once.")
+}
+
+write_tsv(
+  final_snps %>% select(VAR_ID, rsID, Variant_Type, original_SNP),
+  file.path(main_dir, "rsID_map.txt")
+)
+
+# =============================================================================
+# 6. Primary-GWAS alignment and final matrices
+# =============================================================================
+
+gwas_alignment_source <- z_n_mats$df_gwas %>%
+  transmute(
+    ChrPos = SNP,
+    primary_REF = REF,
+    primary_ALT = ALT,
+    primary_Risk_Allele = Risk_Allele,
+    P_VALUE,
+    BETA,
+    SE
   )
 
-ggplot(df_plot, aes(x = col_id, y = -row_group, fill = category, label = display_name)) +
-  geom_tile(color = "white", size = 0.5) +
-  geom_text(size = 5, color = "black", hjust = 0.5, vjust = 0.5) +
-  scale_fill_brewer(palette = "Set3", name = "Category") +   # or use viridis::scale_fill_viridis(discrete = TRUE)
-  theme_minimal(base_size = 10) +
-  theme(
-    axis.title = element_blank(),
-    axis.text = element_blank(),
-    axis.ticks = element_blank(),
-    panel.grid = element_blank(),
-    legend.position = "bottom"
-  ) +
-  labs(title = "Traits Grid Colored by Category",
-       subtitle = "Each tile = one trait (sex-specific shown as F/M)") +
-  coord_fixed(ratio = 0.5)   # adjust ratio so text fits nicely
+gwas_final <- final_snps %>%
+  inner_join(gwas_alignment_source, by = "ChrPos") %>%
+  mutate(
+    BETA_aligned = case_when(
+      primary_ALT == primary_Risk_Allele ~ BETA,
+      primary_REF == primary_Risk_Allele ~ -BETA,
+      TRUE ~ NA_real_
+    )
+  )
 
-# Optional: save as high-res image
-ggsave("traits_grid_colored.png", width = 20, height = 16, dpi = 300)
+if (nrow(gwas_final) != nrow(final_snps) || anyNA(gwas_final$BETA_aligned)) {
+  stop("One or more final variants failed the primary-GWAS alignment audit.")
+}
 
+write_csv(gwas_final, file.path(main_dir, "alignment_GWAS_summStats.csv"))
 
+zmat_pre_imputed <- zmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
+Nmat_pre_imputed <- Nmat_fullset[gwas_final$ChrPos, traits_final, drop = FALSE]
+
+# =============================================================================
+# 7. Impute missing z-scores and sample sizes
+# =============================================================================
+
+set.seed(RANDOM_SEED)
+observed_indices <- which(!is.na(zmat_pre_imputed), arr.ind = TRUE)
+holdout_n <- floor(IMPUTATION_HOLDOUT * nrow(observed_indices))
+if (holdout_n < 1L) {
+  stop("Too few observed z-scores to construct an imputation holdout set.")
+}
+cv_indices <- observed_indices[
+  sample(seq_len(nrow(observed_indices)), size = holdout_n),
+  , drop = FALSE
+]
+
+zmat_cv <- zmat_pre_imputed
+zmat_cv[cv_indices] <- NA_real_
+
+rank_max <- max(1L, min(50L, nrow(zmat_pre_imputed) - 1L,
+                        ncol(zmat_pre_imputed) - 1L))
+lambda_max <- softImpute::lambda0(zmat_pre_imputed)
+lambda_grid <- seq(0.1 * lambda_max, lambda_max, length.out = 10L)
+
+cv_rmse <- vapply(lambda_grid, function(lambda_value) {
+  fit <- softImpute::softImpute(
+    zmat_cv,
+    rank.max = rank_max,
+    lambda = lambda_value,
+    type = "svd"
+  )
+  imputed_cv <- softImpute::complete(zmat_cv, fit)
+  sqrt(mean((zmat_pre_imputed[cv_indices] - imputed_cv[cv_indices])^2))
+}, numeric(1L))
+
+best_lambda <- lambda_grid[which.min(cv_rmse)]
+imputation_fit <- softImpute::softImpute(
+  zmat_pre_imputed,
+  rank.max = rank_max,
+  lambda = best_lambda,
+  type = "svd"
+)
+zmat_imputed <- softImpute::complete(zmat_pre_imputed, imputation_fit)
+
+Nmat_imputed <- apply(Nmat_pre_imputed, 2, function(values) {
+  replace(values, is.na(values), median(values, na.rm = TRUE))
+})
+Nmat_imputed <- as.matrix(Nmat_imputed)
+rownames(Nmat_imputed) <- rownames(Nmat_pre_imputed)
+
+write_tsv(
+  tibble(lambda = lambda_grid, holdout_RMSE = cv_rmse),
+  file.path(main_dir, "softImpute_cross_validation.txt")
+)
+saveRDS(zmat_pre_imputed, file.path(main_dir, "zmat_preImputed.rds"))
+saveRDS(zmat_imputed, file.path(main_dir, "zmat_imputed.rds"))
+
+# =============================================================================
+# 8. Prepare and run bNMF
+# =============================================================================
+
+# prep_z_matrix() writes trait_cor_mat.txt in the working directory. Run it in
+# the results directory so the example never leaves generated files in scripts/.
+prep_in_results_dir <- function(...) {
+  previous_dir <- getwd()
+  on.exit(setwd(previous_dir), add = TRUE)
+  setwd(main_dir)
+  prep_z_matrix(...)
+}
+
+prep_z_output <- prep_in_results_dir(
+  z_mat = zmat_imputed,
+  N_mat = Nmat_imputed,
+  corr_cutoff = CORRELATION_CUTOFF
+)
+
+final_zscore_matrix <- as.matrix(prep_z_output$final_z_mat)
+trait_log <- prep_z_output$df_traits
+if (length(traits_removed_low_N) > 0L) {
+  trait_log <- bind_rows(
+    trait_log,
+    tibble(trait = traits_removed_low_N,
+           result = "removed (low median N)", note = NA_character_)
+  )
+}
+if (length(traits_removed_missing) > 0L) {
+  trait_log <- bind_rows(
+    trait_log,
+    tibble(trait = traits_removed_missing,
+           result = "removed (high missingness)", note = NA_character_)
+  )
+}
+write_csv(trait_log, file.path(main_dir, "df_traits.csv"))
+saveRDS(final_zscore_matrix, file.path(main_dir, "z_score_mat.rds"))
+
+bnmf_settings <- list(
+  n_reps = BNMF_REPS,
+  K = BNMF_K_INITIAL,
+  K0 = BNMF_K0,
+  tolerance = BNMF_TOLERANCE,
+  phi = BNMF_PHI,
+  random_seed = RANDOM_SEED,
+  workers = BNMF_WORKERS
+)
+saveRDS(bnmf_settings, file.path(main_dir, "bnmf_settings.rds"))
+
+future::plan(future::multisession, workers = BNMF_WORKERS)
+bnmf_out <- run_bNMF_parallel(
+  final_zscore_matrix,
+  n_reps = BNMF_REPS,
+  K = BNMF_K_INITIAL,
+  K0 = BNMF_K0,
+  tolerance = BNMF_TOLERANCE,
+  phi = BNMF_PHI,
+  random_seed = RANDOM_SEED
+)
+future::plan(future::sequential)
+saveRDS(bnmf_out, file.path(main_dir, "bnmf_out.rds"))
+
+summarize_bNMF(bnmf_out, dir_save = main_dir)

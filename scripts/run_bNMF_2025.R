@@ -135,7 +135,7 @@ BayesNMF.L2EU <- function(
   iter <- 2
   
 
-  while (del >= tol & iter < n.iter) {
+  while ((iter <= min_iter || del >= tol) && iter < n.iter) {
     # Update matrices efficiently
     lambda_matrix_M[] <- rep(1/lambda, M)
     lambda_matrix_N[] <- rep(1/lambda, N)
@@ -186,6 +186,11 @@ BayesNMF.L2EU <- function(
     
     iter <- iter + 1
   }
+
+  final_active_components <- which(lambda >= lambda.cut)
+  if (length(final_active_components) == 0L) {
+    stop("bNMF ended without any active components.")
+  }
   
   # Return results with convergence metrics
   return(list(
@@ -196,6 +201,8 @@ BayesNMF.L2EU <- function(
     n.lambda = n.lambda,
     n.error = n.error,
     n.active = n.active,
+    lambda_cut = lambda.cut,
+    active_components = final_active_components,
     iterations = iter - 1,
     converged = del < tol
   ))
@@ -239,7 +246,7 @@ run_bNMF_parallel <- function(z_mat, n_reps = 10, random_seed = 1, K = 20, K0 = 
     res <- BayesNMF.L2EU(V0 = z_mat, K = K, K0 = K0, tol = tolerance, phi=phi)
     return(res)
   },
-  .options = furrr_options(seed = TRUE)   # let furrr handle per-worker seeds
+  .options = furrr_options(seed = random_seed)
   )
   
   return(bnmf_reps)
@@ -250,16 +257,38 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
   # Given output from bNMF (list of length N_iterations),
   # generate summary tables and plots
 
+  get_active_components <- function(clustering, zero_tolerance = 1e-10) {
+    if (!is.null(clustering$active_components)) {
+      active <- as.integer(clustering$active_components)
+    } else if (!is.null(clustering$lambda_cut)) {
+      final_lambdas <- clustering$n.lambda[[length(clustering$n.lambda)]]
+      active <- which(final_lambdas >= clustering$lambda_cut)
+    } else {
+      # Backward-compatible fallback for saved results created before the ARD
+      # cutoff and indices were returned explicitly.
+      active <- which(
+        colSums(clustering$W > zero_tolerance) > 0 &
+          rowSums(clustering$H > zero_tolerance) > 0
+      )
+    }
+
+    active <- active[active >= 1L & active <= ncol(clustering$W) &
+                       active <= nrow(clustering$H)]
+    if (length(active) == 0L) {
+      stop("A bNMF repetition has no valid active components.")
+    }
+    unique(active)
+  }
+
   make_run_summary <- function(reps) {
     
     # Given a list of bNMF iteration outputs, summarize the K choices and associated likelihoods across runs
     
     run_summary <- map_dfr(1:length(reps), function(i) {
       res <- reps[[i]]
-      final_lambdas <- res$n.lambda[[length(res$n.lambda)]]
       tibble(
         run=i,
-        K=sum(final_lambdas > min(final_lambdas)),  # Assume that lambdas equal to the minimum lambda are ~ 0
+        K=length(get_active_components(res)),
         evid=res$n.evid[[length(res$n.evid)]]  # Evidence = -log_likelihood
       )
     }) %>%
@@ -287,21 +316,15 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
 
   n.K <- length(run_summary$unique.K)  # Number of distinct K
   
-  get_W <- function(clustering) {
-    W_raw <- clustering$W
-    W_raw[, colSums(W_raw > 1e-10) > 0]
-  }
-  
-  get_H <- function(clustering) {
-    H_raw <- clustering$H
-    H_raw[rowSums(H_raw > 1e-10) > 0, ]
-  }
-  
   print("Plotting variant and trait contributions...")
   silent <- sapply(names(run_summary$unique.K), function(k) {  # Create heatmaps for MAP iteration for each K
     res <- bnmf_reps[[run_summary$MAP.K.run[as.character(k)]]]
-    W <- res$W[, colSums(res$W) != 0]  # feature-cluster association matrix
-    H <- res$H[rowSums(res$H) != 0, ]  # cluster-gene association matrix
+    active <- get_active_components(res)
+    W <- res$W[, active, drop = FALSE]  # feature-cluster association matrix
+    H <- res$H[active, , drop = FALSE]  # cluster-gene association matrix
+    component_names <- paste0("X", seq_along(active))
+    colnames(W) <- component_names
+    rownames(H) <- component_names
     W[W < 1.e-10] <- 0
     H[H < 1.e-10] <- 0
     
@@ -337,7 +360,7 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
       gather(key="cluster", value="activity", -variant) %>%
       mutate(variant=factor(variant, levels=W_variant.ordering),
              cluster=factor(cluster, 
-                            levels=paste0("V", 1:ncol(W))))
+                            levels=component_names))
     W_plt <- ggplot(W_plt_df, aes(x=variant, y=cluster, fill=activity)) + 
       geom_tile() +
       scale_fill_gradient2(low="white", high ="black", name=paste("Activity", sep="")) +
@@ -357,7 +380,7 @@ summarize_bNMF <- function(bnmf_reps, dir_save=NULL) {
       as.data.frame() %>%
       rownames_to_column(var="trait") %>%
       gather(key="cluster", value="activity", -trait) %>%
-      mutate(cluster=factor(cluster, levels=paste0("V", 1:nrow(H))),
+      mutate(cluster=factor(cluster, levels=component_names),
              trait=factor(trait, levels=H_trait.ordering))
     H_plt <- ggplot(H_plt_df, aes(x=trait, y=cluster, fill=activity)) + 
       geom_tile() +
@@ -403,5 +426,3 @@ test_phi_values <- function(V0, phi_values = c(1.0, 2.0, 5.0, 10.0), n_reps = 10
 # Example usage:
 # phi_test_results <- test_phi_values(V0, phi_values=c(1.0, 2.0, 5.0, 10.0))
 # print(phi_test_results$comparison)
-
-

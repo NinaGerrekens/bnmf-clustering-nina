@@ -135,9 +135,24 @@ v2g <- function(gwas_data, prefix, output_dir,
   # Sanitize prefix for file naming
   prefix <- gsub("[^a-zA-Z0-9_-]", "_", prefix)
 
-  # Read gene symbols once (not per-chromosome)
+  # Cache: this function re-reads the (large) per-chromosome index/scored
+  # files on every call with no resume logic of its own, so if
+  # <prefix>.v2g.tsv.gz already exists (e.g. from a prior run), reuse it
+  # instead of redoing the full per-chromosome computation.
+  out_file <- file.path(output_dir, paste0(prefix, '.v2g.tsv.gz'))
+  if (file.exists(out_file)) {
+    message("v2g(): ", out_file, " already exists -- reusing cached result instead of recomputing.")
+    return(invisible(vroom(out_file, show_col_types = FALSE)))
+  }
+
+  # Read gene symbols once (not per-chromosome). gene_symbol_file has been
+  # observed to contain literal duplicate gene_id/symbol rows (e.g. SEC16B,
+  # RFLNA, MEF2B), which silently duplicates every variant matched to that
+  # gene through the left_join(..., by = "gene_id") below -- dedupe here so
+  # it can't happen.
   gene_symbol <- vroom(gene_symbol_file, show_col_types = FALSE) %>%
-    transmute(gene_id = ensgene, gene = symbol)
+    transmute(gene_id = ensgene, gene = symbol) %>%
+    distinct(gene_id, .keep_all = TRUE)
 
   chrs_present <- sort(unique(gwas_data$chromosome))
   all_combine <- data.frame()
@@ -255,6 +270,7 @@ do_post_analysis <- function(main_dir,
   
   h <- fread(sprintf("%s/L2EU.H.mat.%i.txt",main_dir,k),
              stringsAsFactors = FALSE, data.table = F) %>%
+    dplyr::select(-any_of("cluster")) %>%
     rename_at(
       vars(starts_with("X2hr")), function(x) {gsub("X","",x) })
   

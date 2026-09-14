@@ -15,16 +15,22 @@ The bNMF procedure, as applied here, detects clusters of GWAS variants for some 
 
 ### Quick start
 
-1. Copy `scripts/main_script_example.R` to your project folder and open it.
-2. Fill in the **USER CONFIGURATION** section at the top (paths, thresholds, LDlink token).
-3. Populate a copy of `example_data/clustering_data_source_example.xlsx` with paths to your own summary statistics files.
-4. Run sections sequentially. Steps 2–3 (LD pruning via LDlink) are slow — run once and use `save.image()` / `load()` checkpoints to resume.
+1. Run `Rscript scripts/main_script_example.R` from the repository checkout. It
+   uses the supplied toy summary statistics and does not require an LDlink token.
+2. To adapt the example for a project, copy the driver and manifest, replace the
+   input paths, and review the thresholds in the configuration section.
+3. Enable LDlink pruning only after setting the `LDLINK_TOKEN` environment
+   variable. Proxy replacement additionally requires the per-chromosome rsID
+   maps described below.
+
+The public example ends after `summarize_bNMF()`. Project-specific annotation,
+reporting, and post-hoc analysis should be added in a separate project driver.
 
 Sample input files are provided in `example_data/` to illustrate the expected formats.
 
 ### Requirements
 
-**R packages:** `data.table`, `dplyr`, `tidyverse`, `magrittr`, `readxl`, `LDlinkR`, `furrr`, `parallelly`, `softImpute`, `strex`, `GenomicRanges`, `rtracklayer`, `Rsamtools`, `openxlsx`, `Homo.sapiens`, `vroom`
+**R packages:** `data.table`, `dplyr`, `tidyverse`, `magrittr`, `readxl`, `LDlinkR`, `furrr`, `future`, `parallelly`, `progressr`, `progress`, `softImpute`, `strex`, `GenomicRanges`, `rtracklayer`, `Rsamtools`, `openxlsx`, `Homo.sapiens`, `vroom`. Stability analysis additionally requires `ggplot2`, `pheatmap`, and `clue`.
 
 **LDlink API token:** Several steps use the [LDlinkR](https://cran.r-project.org/package=LDlinkR) package for LD-based operations. Request a free token at https://ldlink.nih.gov/?tab=apiaccess and store it as the environment variable `LDLINK_TOKEN`.
 
@@ -54,7 +60,7 @@ See `example_data/clustering_data_source_example.xlsx` for a working example of 
 * **`snp_clump()`** — Position-based clumping of variants within a window
 * **`ld_pruning_SNP.clip()`** — Multi-population LD pruning via LDlink SNPclip API
 * **`window_to_sentinels()`** — Restrict a variant pool to within a window of LD-pruned sentinels (keeps proxy candidate fetch tractable for polygenic traits)
-* **`find_variants_needing_proxies()`** — Flag strand-ambiguous, multiallelic, high-missingness, or non-TOPMed variants for proxy replacement
+* **`find_variants_needing_proxies()`** — Flag strand-ambiguous, multiallelic, or high-missingness variants for proxy replacement
 * **`choose_proxies()`** — Search for LD proxies via LDlinkR and select the best candidate per variant
 
 #### `prep_bNMF_2025.R` — Summary statistics fetch and z-score matrix preparation
@@ -65,6 +71,9 @@ See `example_data/clustering_data_source_example.xlsx` for a working example of 
 * **`BayesNMF.L2EU()`** — Core L2-Euclidean Bayesian NMF with ARD prior (auto-selects number of clusters K)
 * **`run_bNMF_parallel()`** — Run multiple bNMF replicates in parallel using `furrr`
 * **`summarize_bNMF()`** — Summarize replicate results and generate W/H heatmaps
+
+#### `run_bNMF_optimized.R` — Optimized bNMF execution
+* **`run_bNMF_parallel_checkpointed()`** — Optimized, deterministic parallel runner with atomic per-repetition checkpoints and resume support
 
 #### `post_bNMF_2025.R` — Post-hoc analysis
 * **`calculate_cutoff()`** — Determine optimal cluster activity weight cutoff (elbow method)
@@ -83,6 +92,8 @@ Most pipeline steps print progress messages. Key output files written to the res
 |---|---|
 | `run_summary.txt` | Chosen K and negative log-likelihood for each bNMF replicate |
 | `z_score_mat.rds` | Final N × M z-score matrix after all preprocessing |
+| `bnmf_out.rds` | All bNMF replicate outputs, retained for stability analysis |
+| `bnmf_checkpoints/` | Per-repetition checkpoints when the optional optimized runner is used |
 | `L2EU.W.mat.K[K].txt` | Feature (trait) weight matrix for cluster count K |
 | `L2EU.H.mat.K[K].txt` | Variant weight matrix for cluster count K |
 | `W_plot_K[K].pdf` | Heatmap of trait contributions to clusters |
@@ -90,6 +101,16 @@ Most pipeline steps print progress messages. Key output files written to the res
 | `quality_control_report.txt` | QC summary across all pipeline steps |
 | `rsID_map.txt` | Final variant set with VAR_ID → rsID mapping |
 | `alignment_GWAS_summStats.csv` | Aligned GWAS summary statistics for final variant set |
+
+### Stability analysis
+
+After a completed run, assess run-to-run component recovery and variant co-assignment stability without re-running bNMF:
+
+```sh
+Rscript scripts/assess_bNMF_stability.R my_trait_v1_results
+```
+
+The command writes its tables, plots, and consensus matrix to `my_trait_v1_results/stability_analysis/` by default.
 
 ---
 

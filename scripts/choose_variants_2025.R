@@ -14,8 +14,7 @@
 #   count_traits_per_variant()   — (deprecated) Count non-missing traits per variant
 #   count_traits_per_variant_2025() — Parallel version of above
 #   window_to_sentinels()        — Filter variant pool to within kb-window of sentinel variants
-#   check_topmed_presence()      — Liftover hg19 variants to hg38 and confirm presence in TOPMed VCFs
-#   find_variants_needing_proxies() — Flag strand-ambiguous, multiallelic, high-missingness, or non-TOPMed variants
+#   find_variants_needing_proxies() — Flag strand-ambiguous, multiallelic, or high-missingness variants
 #   choose_proxies()             — Search for LD proxies via LDlinkR::LDproxy_batch
 #
 # Assumptions:
@@ -29,9 +28,6 @@ library(data.table)
 library(LDlinkR)
 library(future)
 library(future.apply)
-
-# Set up a parallel plan — adjust workers based on your system
-plan(multisession, workers = 2)
 
 get_sig_snps <- function(gwas, PVCUTOFF = 5e-8, rename_cols = NULL) {
   # Prepare an empty list to store per-population results
@@ -50,7 +46,7 @@ get_sig_snps <- function(gwas, PVCUTOFF = 5e-8, rename_cols = NULL) {
     vars_pop_list <- lapply(seq_along(gwas_ss_files_pop), function(i) {
       cur_id <- names(gwas_ss_files_pop)[i]
       message(sprintf("...Reading %s...", cur_id))
-      
+
       # Read summary stats and rename columns if necessary
       vars <- fread(gwas_ss_files_pop[i],
                     stringsAsFactors = FALSE,
@@ -129,24 +125,22 @@ get_biggest_gwas <- function(main_ss_filepath, vars_sig) {
   message("Getting p-values from largest GWAS...")
   
   # Write the list of VAR_IDs to a temporary file
-  tmp_file <- "all_varid.tmp"
+  tmp_file <- tempfile("all_varid_", fileext = ".tmp")
+  on.exit(unlink(tmp_file), add = TRUE)
   write_lines(vars_sig2$VAR_ID, tmp_file)
   
-  # Retrieve header from the compressed file.  
-  # (This assumes that the first line of the file is a header.)
-  headers <- fread(cmd = sprintf("gzip -cd %s | head -n1", main_ss_filepath),
-                   header = FALSE,
-                   data.table = FALSE,
-                   stringsAsFactors = FALSE)
-  colnames(headers) <- NULL  # Just to ensure no confusion if headers come in as a data frame
-  header_line <- as.character(headers[1, ])  # use the header line for column names
+  header_line <- names(fread(main_ss_filepath, nrows = 0L))
   
   # Grep for VAR_IDs in the GWAS file using fgrep
   message("Grepping for VAR_IDs...")
   rename_cols <- c(PVALUE="P_VALUE")
-                   
-                     
-  main_gwas <- fread(cmd = sprintf("gzip -cd %s | fgrep -wf %s", main_ss_filepath, tmp_file),
+
+  grep_command <- if (endsWith(main_ss_filepath, ".gz")) {
+    sprintf("gzip -cd %s | grep -Fwf %s", shQuote(main_ss_filepath), shQuote(tmp_file))
+  } else {
+    sprintf("grep -Fwf %s %s", shQuote(tmp_file), shQuote(main_ss_filepath))
+  }
+  main_gwas <- fread(cmd = grep_command,
                         header = FALSE,
                         data.table = FALSE,
                         stringsAsFactors = FALSE,
@@ -472,7 +466,7 @@ ld_pruning_SNP.clip <- function(df_snps,
     arrange(PVALUE)
   
   #— 1) Find which chr‐files are already done
-  pattern <- sprintf("^snpClip_results_%s_chr(\\\\d+)\\.txt$", pop)
+  pattern <- sprintf("^snpClip_results_%s_chr([0-9]+)\\.txt$", pop)
   done_files <- list.files(output_dir, pattern = pattern, full.names = TRUE)
   done_chr <- if (length(done_files) > 0) {
     as.integer(sub(pattern, "\\1", basename(done_files)))
@@ -493,13 +487,13 @@ ld_pruning_SNP.clip <- function(df_snps,
     out_file <- file.path(output_dir, sprintf("snpClip_results_%s_chr%i.txt", pop, i))
     if (file.exists(out_file)) {
       message(" Chr ", i, " already done; skipping.")
-      return(NULL)
+      return(TRUE)
     }
     message(" Processing Chr ", i, " …")
     cur_chr <- snp_clip_input %>% filter(CHR == i)
     if (nrow(cur_chr) == 0) {
       message("  No SNPs on Chr ", i, "; skipping.")
-      return(NULL)
+      return(TRUE)
     }
     
     clipped_res <- NULL
@@ -543,6 +537,7 @@ ld_pruning_SNP.clip <- function(df_snps,
       message(" Chromosome ", i, " has >5000 SNPs; breaking into sections...")
       var_df_list <- split(cur_chr, (seq(nrow(cur_chr)) - 1) %/% 5000)
       kept_snps <- c()
+      chunk_failed <- FALSE
       
       for (j in seq_along(var_df_list)) {
         message(sprintf(" Pruning subset %i for chromosome %i...", j, i))
@@ -570,45 +565,72 @@ ld_pruning_SNP.clip <- function(df_snps,
             pull(RS_Number)
           kept_snps <- c(kept_snps, kept_snps_subset)
           message(sprintf(" Subset %i pruned to %i SNPs...", j, length(kept_snps_subset)))
+        } else {
+          chunk_failed <- TRUE
         }
       }
       
-      # Final pruning pass over combined kept SNPs
-      message(sprintf(" Performing final chromosomal pruning for %i SNPs...", length(kept_snps)))
-      clipped_res <- tryCatch({
-        LDlinkR::SNPclip(
-          snps = kept_snps,
-          pop = pop,
-          r2_threshold = r2,
-          maf_threshold = maf,
-          token = token,
-          file = FALSE,
-          genome_build = "grch37"
-        )
-      }, error = function(e) {
-        message("Final SNPclip error: ", e$message)
-        NULL
-      })
+      if (chunk_failed || length(kept_snps) == 0L) {
+        message(" At least one SNPclip subset failed; discarding the partial chromosome result.")
+        clipped_res <- NULL
+      } else {
+        # Final pruning pass over combined kept SNPs
+        message(sprintf(" Performing final chromosomal pruning for %i SNPs...", length(kept_snps)))
+        clipped_res <- tryCatch({
+          LDlinkR::SNPclip(
+            snps = kept_snps,
+            pop = pop,
+            r2_threshold = r2,
+            maf_threshold = maf,
+            token = token,
+            file = FALSE,
+            genome_build = "grch37"
+          )
+        }, error = function(e) {
+          message("Final SNPclip error: ", e$message)
+          NULL
+        })
+      }
     }
     
+    #— Validate the API response before trusting it. LDlinkR can return a
+    # malformed object (rate limit, transient API error, empty body) without
+    # actually throwing an R error, which would otherwise crash the filter()/
+    # fwrite() below with an obscure "object 'Details' not found" error and take
+    # the whole multi-chromosome loop down. Treat anything unexpected as a
+    # failed chromosome instead -- it's skipped (no output file written), so
+    # the file.exists() cache-skip above will retry just this chromosome on
+    # the next run.
+    if (!is.null(clipped_res) &&
+        (!is.data.frame(clipped_res) || !all(c("Details", "RS_Number") %in% names(clipped_res)))) {
+      message("  Chr ", i, ": unexpected API response (missing Details/RS_Number column) -- treating as failed.")
+      message("  Raw response:\n  ", paste(utils::capture.output(str(clipped_res)), collapse = "\n  "))
+      clipped_res <- NULL
+    }
+
     #— Write out if successful
     if (!is.null(clipped_res)) {
       data.table::fwrite(clipped_res, file = out_file, sep = "\t", quote = FALSE)
-      msg <- sprintf("  Chr %i: %i → %i SNPs", 
+      msg <- sprintf("  Chr %i: %i → %i SNPs",
                      i, nrow(cur_chr), nrow(clipped_res %>% filter(Details == "Variant kept.")))
       message(msg)
     } else {
       message("  No results for Chr ", i)
     }
     message("  elapsed: ", round(difftime(Sys.time(), st, units = "secs"), 1), "s")
-    return(NULL)
+    return(!is.null(clipped_res))
   }
   
   #— 4) Run chromosomes (parallel or not)
   if (parallel) {
-    future.apply::future_lapply(pending_chr, process_chromosome)
+    completed_ok <- future.apply::future_lapply(pending_chr, process_chromosome)
   } else {
-    lapply(pending_chr, process_chromosome)
+    completed_ok <- lapply(pending_chr, process_chromosome)
+  }
+  failed_chr <- pending_chr[!unlist(completed_ok, use.names = FALSE)]
+  if (length(failed_chr) > 0L) {
+    stop("LD pruning failed for chromosome(s) ", paste(failed_chr, collapse = ", "),
+         ". No partial result will be returned; rerun to retry them.")
   }
   
   #— 5) Read all results
@@ -780,90 +802,9 @@ window_to_sentinels <- function(candidates, sentinels, window_kb = 500) {
 
 
 # -----------------------------------------------------------------------------
-#' Check which hg19 variants are present in TOPMed (BRAVO VCF files)
-#'
-#' Lifts variant positions from hg19 to hg38 using a liftOver chain file, then
-#' queries per-chromosome BRAVO VCF files (tabix-indexed) via Rsamtools to confirm
-#' presence by position. Variants that fail liftover are treated as absent.
-#' Called twice in the pipeline: once for pruned_vars (to flag "not_in_topmed")
-#' and once for the proxy candidate pool (to restrict proxy selection to TOPMed).
-#'
-#' @param variants_hg19  data.frame with columns VAR_ID (CHR_POS_REF_ALT),
-#'                       CHR (character or integer), POS (integer) — hg19 coordinates
-#' @param chain_file     path to hg19ToHg38.over.chain file
-#' @param vcf_dir        directory containing chr*.bravo.pub.vcf.gz (+ .tbi index) files
-#' @return character vector of VAR_IDs confirmed present in TOPMed at the
-#'         lifted-over hg38 position; absent or unliftable variants are excluded
-check_topmed_presence <- function(variants_hg19, chain_file, vcf_dir) {
-
-  if (!requireNamespace("rtracklayer", quietly = TRUE))
-    stop("rtracklayer required. Install via: BiocManager::install('rtracklayer')")
-  if (!requireNamespace("Rsamtools", quietly = TRUE))
-    stop("Rsamtools required. Install via: BiocManager::install('Rsamtools')")
-
-  message(sprintf("  [TOPMed] Lifting over %d variants (hg19 -> hg38)...", nrow(variants_hg19)))
-  chain <- rtracklayer::import.chain(chain_file)
-
-  gr_hg19 <- GenomicRanges::GRanges(
-    seqnames = paste0("chr", variants_hg19$CHR),
-    ranges   = IRanges::IRanges(start = as.integer(variants_hg19$POS),
-                                end   = as.integer(variants_hg19$POS)),
-    VAR_ID   = variants_hg19$VAR_ID
-  )
-
-  lifted_list <- rtracklayer::liftOver(gr_hg19, chain)
-
-  # Discard variants that map to 0 or multiple hg38 positions
-  one_to_one <- lengths(lifted_list) == 1L
-  n_dropped  <- sum(!one_to_one)
-  if (n_dropped > 0)
-    message(sprintf("  [TOPMed] %d variant(s) failed liftover — treated as absent.", n_dropped))
-
-  gr_hg38 <- unlist(lifted_list[one_to_one])
-
-  df_hg38 <- data.frame(
-    VAR_ID  = gr_hg38$VAR_ID,
-    chr_num = sub("^chr", "", as.character(GenomicRanges::seqnames(gr_hg38))),
-    pos     = GenomicRanges::start(gr_hg38),
-    stringsAsFactors = FALSE
-  )
-
-  confirmed <- character(0)
-
-  for (chr_num in unique(df_hg38$chr_num)) {
-    vcf_path <- file.path(vcf_dir, sprintf("chr%s.bravo.pub.vcf.gz", chr_num))
-
-    if (!file.exists(vcf_path)) {
-      message(sprintf("  [TOPMed] VCF not found: chr%s.bravo.pub.vcf.gz — %d variant(s) marked absent.",
-                      chr_num, sum(df_hg38$chr_num == chr_num)))
-      next
-    }
-
-    chr_df <- df_hg38[df_hg38$chr_num == chr_num, ]
-
-    ranges <- GenomicRanges::GRanges(
-      paste0("chr", chr_num),
-      IRanges::IRanges(start = chr_df$pos, end = chr_df$pos)
-    )
-
-    tbx  <- Rsamtools::TabixFile(vcf_path)
-    hits <- Rsamtools::scanTabix(tbx, param = ranges)
-
-    # hits: named list, one element per queried range; non-empty = position found in VCF
-    found      <- vapply(hits, function(x) length(x) > 0L, logical(1L))
-    confirmed  <- c(confirmed, chr_df$VAR_ID[found])
-  }
-
-  message(sprintf("  [TOPMed] %d / %d variants confirmed present in TOPMed.",
-                  length(confirmed), nrow(variants_hg19)))
-  confirmed
-}
-
-
 find_variants_needing_proxies <- function(gwas_variant_df,
                                           var_nonmissingness,
-                                          missing_cutoff = 0.8,
-                                          topmed_fails   = NULL) {
+                                          missing_cutoff = 0.8) {
 
   print("Choosing variants in need of proxies...")
 
@@ -892,15 +833,6 @@ find_variants_needing_proxies <- function(gwas_variant_df,
     proxy_reasons_list[["high_missingness"]] <- data.frame(VAR_ID = low_cnt, reason = "high_missingness", stringsAsFactors = FALSE)
   }
 
-  # Find variants absent from TOPMed (optional — only when topmed_fails is provided)
-  if (!is.null(topmed_fails)) {
-    not_topmed <- intersect(gwas_variant_df$VAR_ID, topmed_fails)
-    print(paste0("...", length(not_topmed), " variants not found in TOPMed"))
-    if (length(not_topmed) > 0) {
-      proxy_reasons_list[["not_in_topmed"]] <- data.frame(VAR_ID = not_topmed, reason = "not_in_topmed", stringsAsFactors = FALSE)
-    }
-  }
-  
   # Combine all reasons and handle overlaps
   if (length(proxy_reasons_list) > 0) {
     all_reasons <- bind_rows(proxy_reasons_list)
@@ -935,7 +867,8 @@ choose_proxies <- function(need_proxies,
                            population = "EUR",
                            frac_nonmissing_num = 0.8,
                            r2_num = 0.8,
-                           topmed_present_snps = NULL) {  # optional: hg19 ChrPos (e.g. "1:12345") confirmed in TOPMed
+                           variant_metadata = NULL,
+                           output_dir = ".") {
 
   message(sprintf("Number of rows in need_proxies: %d", nrow(need_proxies)))
 
@@ -951,21 +884,42 @@ choose_proxies <- function(need_proxies,
     select(-c(CHR, POS, REF, ALT))
   need_proxies_snps <- need_proxies$query_snp
 
-  LDlinkR::LDproxy_batch(need_proxies_snps,
-                         pop            = population,
-                         r2d            = "r2",
-                         token          = token,
-                         append         = TRUE,
-                         genome_build   = "grch37")
-
-  # LDproxy_batch writes combined_query_snp_list_grch37.txt to the working directory
-  proxy_out_file <- "./combined_query_snp_list_grch37.txt"
+  # Keep LDlink batch output and the failed-proxy log inside the run-specific
+  # results directory so one analysis cannot accidentally reuse another's cache.
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  output_dir <- normalizePath(output_dir)
+  proxy_out_file <- file.path(output_dir, "combined_query_snp_list_grch37.txt")
+  proxy_meta_file <- file.path(output_dir, "combined_query_snp_list_grch37.meta.rds")
+  expected_proxy_meta <- list(
+    query_snps = sort(unique(need_proxies_snps)),
+    population = population,
+    genome_build = "grch37"
+  )
+  if (!file.exists(proxy_out_file)) {
+    calling_dir <- getwd()
+    on.exit(setwd(calling_dir), add = TRUE)
+    setwd(output_dir)
+    LDlinkR::LDproxy_batch(need_proxies_snps,
+                           pop            = population,
+                           r2d            = "r2",
+                           token          = token,
+                           append         = TRUE,
+                           genome_build   = "grch37")
+    if (file.exists(proxy_out_file)) saveRDS(expected_proxy_meta, proxy_meta_file)
+  } else {
+    if (!file.exists(proxy_meta_file) ||
+        !identical(readRDS(proxy_meta_file), expected_proxy_meta)) {
+      stop("Existing LDproxy cache does not match this query/population: ",
+           proxy_out_file, ". Move or remove that cache before rerunning.")
+    }
+    message("Skipping LDproxy_batch — validated matching cache already exists.")
+  }
   if (file.exists(proxy_out_file)) {
     proxy_df <- read.table(proxy_out_file, sep = "\t", header = TRUE, row.names = NULL) %>%
       filter(R2 > 0.1) %>%
       filter(!Coord %in% need_proxies_snps) %>%
       inner_join(need_proxies, by = "query_snp") %>%   # join on query_snp col present in LDproxy batch output
-      filter(!duplicated(RS_Number)) %>%
+      distinct(rsID, RS_Number, .keep_all = TRUE) %>%
       select(rsID, proxy_rsID = RS_Number, r2 = R2)
   } else {
     proxy_df <- data.frame(rsID = character(), proxy_rsID = character(), r2 = numeric())
@@ -990,7 +944,8 @@ choose_proxies <- function(need_proxies,
     for (chr_file in chr_files) {
       chr_name <- basename(chr_file)
       # message(sprintf("Searching %s...", chr_name))
-      chr_rsid_map <- fread(chr_file, 
+      chr_rsid_map <- fread(chr_file,
+                            header = FALSE,
                             col.names = c("hg19_posID", "proxy_rsID", "ref_allele", "alt_allele"),
                             key = "proxy_rsID")
       chr_matches <- chr_rsid_map[proxy_rsID %in% proxy_rsids]
@@ -1001,40 +956,41 @@ choose_proxies <- function(need_proxies,
     if (length(potential_proxies_list) > 0) {
       potential_proxies_map <- rbindlist(potential_proxies_list)
       potential_proxies_map <- as.data.frame(potential_proxies_map)
-      
+
       # Process Map: Extract Coords and Fix Orientation
       potential_proxies_map <- potential_proxies_map %>%
         separate(hg19_posID, into = c("CHR", "POS"), sep = ":", remove = FALSE) %>%
-        mutate(CHR = gsub("chr", "", CHR), 
-               proxy_VAR_ID_orig = paste(CHR, POS, ref_allele, alt_allele, sep = "_"),
-               proxy_VAR_ID_flip = paste(CHR, POS, alt_allele, ref_allele, sep = "_"),
+        mutate(CHR = gsub("chr", "", CHR),
                proxy_ChrPos = paste(CHR, POS, sep = ":")) %>%
-        filter(proxy_ChrPos %in% rownames(zmat_fullset)) %>%
-        mutate(
-          proxy_VAR_ID = case_when(
-            proxy_VAR_ID_orig %in% rownames(zmat_fullset) ~ proxy_VAR_ID_orig, 
-            proxy_VAR_ID_flip %in% rownames(zmat_fullset) ~ proxy_VAR_ID_flip,
-            TRUE ~ proxy_VAR_ID_orig 
-          ),
-          REF_final = case_when(proxy_VAR_ID == proxy_VAR_ID_flip ~ alt_allele, TRUE ~ ref_allele),
-          ALT_final = case_when(proxy_VAR_ID == proxy_VAR_ID_flip ~ ref_allele, TRUE ~ alt_allele)
-        ) %>%
-        select(-proxy_VAR_ID_orig, -proxy_VAR_ID_flip) %>%
-        dplyr::rename(REF = REF_final, ALT = ALT_final) %>%
-        select(-ref_allele, -alt_allele)
-      
-      print(sprintf("%i of %i potential proxies in the full z-matrix...", nrow(potential_proxies_map), nrow(proxy_df)))
+        filter(proxy_ChrPos %in% rownames(zmat_fullset))
 
-      # ----- TOPMed filter (optional) -----
-      # Restrict all proxy candidates to those confirmed present in TOPMed so that
-      # the final variant set contains only TOPMed-genotyped variants (better PRS coverage).
-      if (!is.null(topmed_present_snps) && nrow(potential_proxies_map) > 0) {
-        n_before <- nrow(potential_proxies_map)
+      if (!is.null(variant_metadata)) {
+        metadata <- as.data.frame(variant_metadata)
+        if (!"ChrPos" %in% names(metadata) && "SNP" %in% names(metadata)) {
+          metadata <- metadata %>% rename(ChrPos = SNP)
+        }
+        required_metadata <- c("ChrPos", "VAR_ID", "REF", "ALT")
+        if (!all(required_metadata %in% names(metadata))) {
+          stop("variant_metadata must contain ChrPos (or SNP), VAR_ID, REF, and ALT.")
+        }
+        metadata <- metadata %>%
+          select(proxy_ChrPos = ChrPos, proxy_VAR_ID = VAR_ID, REF, ALT) %>%
+          distinct(proxy_ChrPos, .keep_all = TRUE)
         potential_proxies_map <- potential_proxies_map %>%
-          filter(proxy_ChrPos %in% topmed_present_snps)
-        message(sprintf("  TOPMed filter: %d -> %d proxy candidates (removed %d not in TOPMed)",
-                        n_before, nrow(potential_proxies_map), n_before - nrow(potential_proxies_map)))
+          select(-ref_allele, -alt_allele) %>%
+          inner_join(metadata, by = "proxy_ChrPos")
+      } else {
+        warning("variant_metadata was not supplied; proxy VAR_ID allele orientation is taken from the rsID map.")
+        potential_proxies_map <- potential_proxies_map %>%
+          mutate(
+            proxy_VAR_ID = paste(CHR, POS, ref_allele, alt_allele, sep = "_"),
+            REF = ref_allele,
+            ALT = alt_allele
+          ) %>%
+          select(-ref_allele, -alt_allele)
       }
+
+      print(sprintf("%i of %i potential proxies in the full z-matrix...", nrow(potential_proxies_map), nrow(proxy_df)))
 
     } else {
       potential_proxies_map <- data.frame()
@@ -1086,8 +1042,9 @@ choose_proxies <- function(need_proxies,
   message(sprintf("No adequate proxies found for %d variants.", length(no_proxies_found)))
   
   if (length(no_proxies_found) > 0) {
-    write(no_proxies_found, "no_proxies_found.txt")
-    message("See no_proxies_found.txt for a list of these variants.")
+    no_proxy_file <- file.path(output_dir, "no_proxies_found.txt")
+    write(no_proxies_found, no_proxy_file)
+    message("See ", no_proxy_file, " for a list of these variants.")
   }
 
   # ==========================================================
