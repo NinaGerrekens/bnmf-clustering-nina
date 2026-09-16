@@ -4,6 +4,8 @@ Cluster weights are available from the [Smith, Deutsch et al Nature Medicine 202
 * In the weights files, the "Effect_Allele" column denotes the T2D risk-increasing allele.
 * When generating the pPS, all genotypes should be aligned to this allele!
 * Weights have been provided in hg38, however a liftover map (hg19 to hg38) is included in each subfolder.
+ 
+hy
 
 ---
 
