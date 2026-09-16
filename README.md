@@ -5,8 +5,6 @@ Cluster weights are available from the [Smith, Deutsch et al Nature Medicine 202
 * When generating the pPS, all genotypes should be aligned to this allele!
 * Weights have been provided in hg38, however a liftover map (hg19 to hg38) is included in each subfolder.
  
-hy
-
 ---
 
 ## Pipeline for GWAS clustering using Bayesian non-negative matrix factorization (bNMF)
